@@ -9,3 +9,4 @@ register them. Add new tool modules to the imports below as milestones land.
 from codescope.tools.info_tools import *
 from codescope.tools.index_tools import *
 from codescope.tools.search_tools import *
+from codescope.tools.graph_tools import *
