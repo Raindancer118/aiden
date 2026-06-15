@@ -11,3 +11,4 @@ from codescope.tools.index_tools import *
 from codescope.tools.search_tools import *
 from codescope.tools.graph_tools import *
 from codescope.tools.incremental_tools import *
+from codescope.tools.devops_tools import *
