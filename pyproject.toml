@@ -3,10 +3,10 @@ build-backend = "hatchling.build"
 requires = ["hatchling"]
 
 [project]
-name = "serena-agent"
-version = "1.5.4.dev0"
-description = "A powerful MCP toolkit for coding, providing semantic retrieval and editing capabilities - the IDE for your agent"
-authors = [{ name = "Oraios AI", email = "info@oraios-ai.de" }]
+name = "volantic-codescope"
+version = "0.1.0"
+description = "Volantic Codescope - an all-in-one codebase-intelligence MCP: LSP-accurate navigation & editing (via Serena) plus a persistent hybrid index (tree-sitter + SQLite FTS5/BM25 + vectors + trigram), code graphs, and dev-ops (test runner, scaffolding, GitHub)."
+authors = [{ name = "Tom Stieh (Raindancer118)", email = "tom560stieh@gmail.com" }]
 readme = "README.md"
 requires-python = ">=3.11, <3.15"
 classifiers = [
@@ -52,6 +52,14 @@ dependencies = [
   "regex==2026.2.28",
   "pythonnet==3.1.0 ; sys_platform == 'win32'",
   "oslex==2.0.0",
+  # --- Volantic Codescope additions: hybrid index engine + dev-ops ---
+  "tree-sitter>=0.25,<0.26",          # QueryCursor API (>=0.23)
+  "tree-sitter-language-pack==1.8.1", # ~305 grammars in one dependency
+  "sqlite-vec==0.1.9",                # local vector search (pre-v1: pinned exactly)
+  "blake3==1.0.8",                    # fast content hashing for change detection
+  "watchfiles==1.2.0",                # Rust-notify backend, debounced file watching
+  "pygit2==1.19.2",                   # fast git status/diff for incremental reindex
+  # fastembed (local embeddings) added in milestone M3; google-genai already in [google] extra
 ]
 
 
@@ -62,6 +70,7 @@ publish-url = "https://test.pypi.org/legacy/"
 explicit = true
 
 [project.scripts]
+codescope = "codescope.cli:main"
 serena = "serena.cli:top_level"
 serena-agent = "serena.cli:top_level"
 serena-hooks = "serena.hooks:hook_commands"
@@ -101,10 +110,11 @@ agno = ["agno==2.5.10", "sqlalchemy==2.0.41"]  # agno bumped for session state o
 google = ["google-genai==1.27.0"]
 
 [project.urls]
-Homepage = "https://github.com/oraios/serena"
+Homepage = "https://github.com/Raindancer118/volantic-codescope"
+Upstream = "https://github.com/oraios/serena"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/serena", "src/interprompt", "src/solidlsp"]
+packages = ["src/codescope", "src/serena", "src/interprompt", "src/solidlsp"]
 
 [tool.doc8]
 max-line-length = 1000

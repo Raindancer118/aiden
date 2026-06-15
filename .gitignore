@@ -276,3 +276,11 @@ zz-misc/
 vue-implementation/
 
 news/news.json
+
+# --- Volantic Codescope ---
+# Self-notes for the agent; intentionally not committed.
+Project.md
+# Codescope index artifacts (per-project SQLite index lives under .serena/codescope/)
+**/.serena/codescope/
+*.codescope.db
+*.codescope.db-*
