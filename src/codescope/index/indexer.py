@@ -213,6 +213,59 @@ class Indexer:
             duration_s=round(time.time() - start, 3),
         )
 
+    def reindex_paths(
+        self,
+        rel_paths: list[str],
+        *,
+        force: bool = True,
+        embeddings: bool = True,
+        embedder: Embedder | None = None,
+    ) -> ReindexReport:
+        """Incrementally (re)index a specific set of files.
+
+        Missing files are pruned. Used by the git-scoped sync and the file
+        watcher. ``force`` defaults to True since callers already know the
+        files changed, but the per-file hash still prevents redundant writes
+        when ``force`` is False.
+        """
+        start = time.time()
+        indexed = skipped = errors = removed = 0
+        pending: list[tuple[int, str, str, str]] = []
+        store = IndexStore(self.db_path)
+        try:
+            resolved_embedder = self._resolve_embedder(embeddings, embedder) if store.vec_enabled else None
+            for rel in dict.fromkeys(rel_paths):  # de-dup, preserve order
+                abs_path = self.root / rel
+                if not abs_path.exists():
+                    if rel in store.indexed_paths():
+                        store.delete_file(rel)
+                        removed += 1
+                    continue
+                if spec_for_path(rel) is None:
+                    continue
+                outcome, inserted = self.index_file(store, abs_path, rel, force=force)
+                if outcome == "indexed":
+                    indexed += 1
+                    pending.extend(inserted)
+                elif outcome == "error":
+                    errors += 1
+                else:
+                    skipped += 1
+            if resolved_embedder is not None and pending:
+                self._embed_pending(store, resolved_embedder, pending)
+            store.commit()
+            stats = store.stats()
+        finally:
+            store.close()
+        return ReindexReport(
+            indexed=indexed,
+            skipped_unchanged=skipped,
+            removed=removed,
+            errors=errors,
+            stats=stats,
+            duration_s=round(time.time() - start, 3),
+        )
+
     @staticmethod
     def _embed_pending(store: IndexStore, embedder: Embedder, pending: list[tuple[int, str, str, str]]) -> None:
         rows = [(sid, body, path, lang) for sid, body, path, lang in pending if body.strip()]
