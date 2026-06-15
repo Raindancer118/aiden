@@ -29,9 +29,9 @@ class CodescopeInfoTool(Tool, ToolMarkerDoesNotRequireActiveProject):
             "Built on Serena (LSP-accurate navigation & structural editing).",
             "",
             "Codescope adds the following capability groups:",
-            "  - Hybrid search: BM25 (FTS5) + vector (sqlite-vec) + trigram, fused via RRF  [milestone M3]",
-            "  - Code graphs: dependencies, dependents, call chains, change impact          [milestone M4]",
-            "  - Persistent index: tree-sitter symbols in SQLite, incremental reindex        [milestone M2/M5]",
+            "  - Persistent index: tree-sitter symbols in SQLite (33 languages)              [reindex, index_status]",
+            "  - Hybrid search: BM25 (FTS5) + local vector (sqlite-vec) + trigram, RRF-fused  [search_code, search_semantic, search_regex]",
+            "  - Code graphs: dependencies, dependents, call chains, change impact           [milestone M4]",
             "  - Dev-ops: auto test runner, project scaffolding, GitHub operations           [milestone M6]",
         ]
         return "\n".join(lines)

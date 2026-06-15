@@ -15,11 +15,19 @@ so a file's rows can be removed precisely on reindex.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 
 from codescope.index.parser import RefHit, SymbolDef
+
+log = logging.getLogger(__name__)
+
+
+def _encode_vector(vec: list[float]) -> bytes:
+    return struct.pack(f"{len(vec)}f", *vec)
 
 SCHEMA_VERSION = 1
 
@@ -82,6 +90,8 @@ class IndexStats:
     symbols: int
     refs: int
     languages: dict[str, int]
+    vectors: int
+    embedder: str | None
 
 
 class IndexStore:
@@ -94,7 +104,20 @@ class IndexStore:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
+        self.vec_enabled = self._load_sqlite_vec()
         self._init_schema()
+
+    def _load_sqlite_vec(self) -> bool:
+        try:
+            import sqlite_vec
+
+            self.conn.enable_load_extension(True)
+            sqlite_vec.load(self.conn)
+            self.conn.enable_load_extension(False)
+            return True
+        except Exception as e:  # pragma: no cover - platform dependent
+            log.info("sqlite-vec not available; vector search disabled: %s", e)
+            return False
 
     def _init_schema(self) -> None:
         self.conn.executescript(_SCHEMA)
@@ -104,6 +127,66 @@ class IndexStore:
             (str(SCHEMA_VERSION),),
         )
         self.conn.commit()
+
+    # -- meta -------------------------------------------------------------
+
+    def get_meta(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+
+    # -- vector table -----------------------------------------------------
+
+    def ensure_vec_table(self, dim: int, embedder_id: str) -> bool:
+        """Create the sqlite-vec table for ``dim`` if needed. Returns success."""
+        if not self.vec_enabled:
+            return False
+        existing = self.get_meta("embedder_dim")
+        if existing is not None and int(existing) != dim:
+            # Embedder changed: drop stale vectors so dimensions stay consistent.
+            self.conn.execute("DROP TABLE IF EXISTS chunks_vec")
+        self.conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0("
+            f"sid integer primary key, embedding float[{dim}], +path text, +lang text)"
+        )
+        self.set_meta("embedder_dim", str(dim))
+        self.set_meta("embedder_id", embedder_id)
+        return True
+
+    def has_vectors(self) -> bool:
+        if not self.vec_enabled:
+            return False
+        row = self.conn.execute("SELECT name FROM sqlite_master WHERE name='chunks_vec'").fetchone()
+        if row is None:
+            return False
+        return self.conn.execute("SELECT COUNT(*) FROM chunks_vec").fetchone()[0] > 0
+
+    def insert_embeddings(self, rows: list[tuple[int, list[float], str, str]]) -> None:
+        if not self.vec_enabled or not rows:
+            return
+        self.conn.executemany(
+            "INSERT INTO chunks_vec(sid, embedding, path, lang) VALUES(?,?,?,?)",
+            [(sid, _encode_vector(vec), path, lang) for sid, vec, path, lang in rows],
+        )
+
+    def vector_search(self, query_vec: list[float], k: int) -> list[tuple[int, float]]:
+        """Return [(symbol_id, distance)] for the k nearest symbols."""
+        if not self.has_vectors():
+            return []
+        return self.conn.execute(
+            "SELECT sid, distance FROM chunks_vec WHERE embedding MATCH ? AND k=? ORDER BY distance",
+            (_encode_vector(query_vec), k),
+        ).fetchall()
+
+    def _vec_table_exists(self) -> bool:
+        if not self.vec_enabled:
+            return False
+        return self.conn.execute("SELECT name FROM sqlite_master WHERE name='chunks_vec'").fetchone() is not None
 
     # -- change detection -------------------------------------------------
 
@@ -123,6 +206,8 @@ class IndexStore:
             placeholders = ",".join("?" * len(ids))
             cur.execute(f"DELETE FROM symbols_fts WHERE rowid IN ({placeholders})", ids)
             cur.execute(f"DELETE FROM symbols_trgm WHERE rowid IN ({placeholders})", ids)
+            if self._vec_table_exists():
+                cur.execute(f"DELETE FROM chunks_vec WHERE sid IN ({placeholders})", ids)
         cur.execute("DELETE FROM symbols WHERE path=?", (path,))
         cur.execute("DELETE FROM refs WHERE path=?", (path,))
         cur.execute("DELETE FROM files WHERE path=?", (path,))
@@ -137,14 +222,19 @@ class IndexStore:
         indexed_at: float,
         symbols: list[SymbolDef],
         refs: list[RefHit],
-    ) -> None:
-        """Replace all rows for ``path`` with freshly parsed data (single txn)."""
+    ) -> list[tuple[int, str, str, str]]:
+        """Replace all rows for ``path`` with freshly parsed data (single txn).
+
+        :return: list of ``(symbol_id, body, path, lang)`` for the inserted
+            symbols, so the caller can batch-embed bodies afterwards.
+        """
         cur = self.conn.cursor()
         self.delete_file(path)
         cur.execute(
             "INSERT INTO files(path, lang, hash, mtime, size, indexed_at) VALUES(?,?,?,?,?,?)",
             (path, lang, file_hash, mtime, size, indexed_at),
         )
+        inserted: list[tuple[int, str, str, str]] = []
         for s in symbols:
             cur.execute(
                 "INSERT INTO symbols(path, name, kind, start_line, start_col, end_line, end_col, signature) "
@@ -152,16 +242,19 @@ class IndexStore:
                 (path, s.name, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.signature),
             )
             sid = cur.lastrowid
+            assert sid is not None
             cur.execute(
                 "INSERT INTO symbols_fts(rowid, name, path, body, kind) VALUES(?,?,?,?,?)",
                 (sid, s.name, path, s.body, s.kind),
             )
             cur.execute("INSERT INTO symbols_trgm(rowid, body) VALUES(?,?)", (sid, s.body))
+            inserted.append((sid, s.body, path, lang))
         if refs:
             cur.executemany(
                 "INSERT INTO refs(path, name, kind, line, col) VALUES(?,?,?,?,?)",
                 [(path, r.name, r.kind, r.line, r.col) for r in refs],
             )
+        return inserted
 
     def commit(self) -> None:
         self.conn.commit()
@@ -178,7 +271,17 @@ class IndexStore:
         n_syms = c.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
         n_refs = c.execute("SELECT COUNT(*) FROM refs").fetchone()[0]
         langs = dict(c.execute("SELECT lang, COUNT(*) FROM files GROUP BY lang ORDER BY 2 DESC").fetchall())
-        return IndexStats(files=n_files, symbols=n_syms, refs=n_refs, languages=langs)
+        n_vec = 0
+        if self._vec_table_exists():
+            n_vec = c.execute("SELECT COUNT(*) FROM chunks_vec").fetchone()[0]
+        return IndexStats(
+            files=n_files,
+            symbols=n_syms,
+            refs=n_refs,
+            languages=langs,
+            vectors=n_vec,
+            embedder=self.get_meta("embedder_id"),
+        )
 
     def __enter__(self) -> "IndexStore":
         return self
