@@ -9,7 +9,6 @@ import pytest
 
 from codescope.devops import scaffold, testrunner, vcs
 
-
 # -- test runner ----------------------------------------------------------- #
 
 

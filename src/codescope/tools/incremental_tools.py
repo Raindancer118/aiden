@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from serena.tools import Tool
-
 from codescope.index.incremental import sync_incremental
 from codescope.index.indexer import Indexer
 from codescope.index.watcher import start_watcher, stop_watcher, watcher_status
+from serena.tools import Tool
 
 
 class SyncIndexTool(Tool):

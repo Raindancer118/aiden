@@ -7,10 +7,9 @@ import shlex
 from dataclasses import asdict
 from pathlib import Path
 
-from serena.tools import Tool, ToolMarkerDoesNotRequireActiveProject
-
 from codescope.devops import github as gh
 from codescope.devops import scaffold, testrunner, vcs
+from serena.tools import Tool, ToolMarkerDoesNotRequireActiveProject
 
 # --------------------------------------------------------------------------- #
 # Test runner

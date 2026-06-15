@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from serena.tools import Tool, ToolMarkerSymbolicRead
-
 from codescope.index.search import SearchEngine
+from serena.tools import Tool, ToolMarkerSymbolicRead
 
 
 class SearchCodeTool(Tool, ToolMarkerSymbolicRead):

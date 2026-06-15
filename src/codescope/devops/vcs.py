@@ -63,7 +63,7 @@ class Changelog:
 
 
 def _git(args: list[str], cwd: str | Path, *, input_text: str | None = None, timeout: int = 60) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, input=input_text, timeout=timeout)
+    return subprocess.run(["git", *args], check=False, cwd=str(cwd), capture_output=True, text=True, input=input_text, timeout=timeout)
 
 
 def sanitize_message(message: str) -> tuple[str, bool]:

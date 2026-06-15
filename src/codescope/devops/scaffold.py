@@ -58,7 +58,7 @@ def _python_template(name: str) -> dict[str, str]:
             "    main()\n"
         ),
         "tests/__init__.py": "",
-        f"tests/test_main.py": (
+        "tests/test_main.py": (
             f"from {mod}.main import main\n\n\n"
             "def test_main_runs(capsys):\n"
             "    main()\n"

@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from serena.tools import Tool
-
 from codescope.index.indexer import Indexer
+from serena.tools import Tool
 
 
 class ReindexTool(Tool):

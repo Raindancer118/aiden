@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from serena.tools import Tool, ToolMarkerSymbolicRead
-
 from codescope.index.graph import GraphEngine, GraphNode
+from serena.tools import Tool, ToolMarkerSymbolicRead
 
 
 def _node_to_dict(node: GraphNode) -> dict:

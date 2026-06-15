@@ -110,7 +110,7 @@ def run_tests(root: Path, extra_args: list[str] | None = None, timeout: int = 18
             note=f"Test command '{cmd[0]}' is not installed.",
         )
     try:
-        proc = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, check=False, cwd=str(root), capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return TestResult(framework=fw.name, command=" ".join(cmd), exit_code=-1, ok=False, note=f"Timed out after {timeout}s.")
     output = (proc.stdout or "") + (proc.stderr or "")

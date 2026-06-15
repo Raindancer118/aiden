@@ -22,7 +22,7 @@ def _gh(args: list[str], *, cwd: str | Path | None = None, parse_json: bool = Fa
         raise GhError("GitHub CLI 'gh' is not installed.")
     proc = subprocess.run(
         ["gh", *args],
-        cwd=str(cwd) if cwd else None,
+        check=False, cwd=str(cwd) if cwd else None,
         capture_output=True,
         text=True,
         timeout=timeout,

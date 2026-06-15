@@ -178,7 +178,7 @@ class SearchEngine:
             raise RuntimeError("ripgrep (rg) is not installed; regex search is unavailable.")
         proc = subprocess.run(
             [rg, "--no-heading", "--line-number", "--color", "never", "--max-count", "50", pattern, str(self.root)],
-            capture_output=True,
+            check=False, capture_output=True,
             text=True,
             timeout=30,
         )

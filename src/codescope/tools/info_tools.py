@@ -4,9 +4,8 @@
 correctly registered into Serena's tool registry.
 """
 
-from serena.tools import Tool, ToolMarkerDoesNotRequireActiveProject
-
 from codescope import PRODUCT_NAME, __version__
+from serena.tools import Tool, ToolMarkerDoesNotRequireActiveProject
 
 
 class CodescopeInfoTool(Tool, ToolMarkerDoesNotRequireActiveProject):

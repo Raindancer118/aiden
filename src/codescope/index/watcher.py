@@ -13,8 +13,8 @@ import threading
 import time
 from pathlib import Path
 
-from codescope.index.indexer import Indexer
 from codescope.index.indexer import _DEFAULT_IGNORE_DIRS as IGNORE_DIRS
+from codescope.index.indexer import Indexer
 from codescope.index.languages import spec_for_path
 
 log = logging.getLogger(__name__)
