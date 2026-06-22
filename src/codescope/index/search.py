@@ -70,6 +70,15 @@ class CloneGroup:
     similarity: float  # mean pairwise similarity within the cluster
 
 
+@dataclass(slots=True)
+class DiffClone:
+    added_path: str
+    added_start_line: int
+    added_end_line: int
+    similarity: float
+    matches: SearchHit  # the closest existing symbol the added block duplicates
+
+
 def _fts_or_query(query: str) -> str | None:
     """Build a safe FTS5 MATCH expression: OR of quoted word tokens."""
     tokens = _WORD_RE.findall(query)
@@ -329,3 +338,46 @@ class SearchEngine:
 
         groups.sort(key=lambda g: (len(g.members), g.similarity), reverse=True)
         return groups[:limit]
+
+    def detect_clones_in_diff(
+        self, *, staged: bool = False, min_lines: int = 5, similarity: float = 0.85, limit: int = 50
+    ) -> list[DiffClone]:
+        """Flag newly added code that duplicates code already in the index.
+
+        A pre-commit / pre-write gate for the "reuse before write" workflow:
+        parses the git diff for blocks of added lines and, for each block of at
+        least ``min_lines`` lines, finds its nearest existing indexed symbol.
+        Blocks whose closest match scores at least ``similarity`` are reported
+        as likely duplication. Self-matches (the same file/line range that the
+        index already covers) are filtered out.
+
+        :param staged: diff the staged changes instead of the working tree.
+            Untracked files only appear once staged or marked intent-to-add.
+        :param min_lines: ignore added blocks shorter than this many lines.
+        :param similarity: cosine threshold for an added block to count as a
+            duplicate of an existing symbol.
+        :param limit: maximum number of findings to return.
+        """
+        from codescope.devops import vcs
+
+        findings: list[DiffClone] = []
+        for block in vcs.added_blocks(self.root, staged=staged, min_lines=min_lines):
+            for hit in self.find_similar_code(block.text, limit=5):
+                same_block = hit.path == block.path and not (
+                    hit.end_line < block.start_line or hit.start_line > block.end_line
+                )
+                if same_block:
+                    continue
+                if hit.score >= similarity:
+                    findings.append(
+                        DiffClone(
+                            added_path=block.path,
+                            added_start_line=block.start_line,
+                            added_end_line=block.end_line,
+                            similarity=hit.score,
+                            matches=hit,
+                        )
+                    )
+                break
+        findings.sort(key=lambda f: f.similarity, reverse=True)
+        return findings[:limit]

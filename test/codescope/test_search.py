@@ -134,6 +134,77 @@ def test_find_duplicate_code_respects_min_lines(indexed_with_clones: tuple[Path,
     assert SearchEngine(root, db_path=db).find_duplicate_code(min_lines=100) == []
 
 
+def test_added_blocks_parses_new_file() -> None:
+    from codescope.devops.vcs import _parse_added_blocks
+
+    diff_text = (
+        "diff --git a/new.py b/new.py\n"
+        "new file mode 100644\n"
+        "index 0000000..1111111\n"
+        "--- /dev/null\n"
+        "+++ b/new.py\n"
+        "@@ -0,0 +1,3 @@\n"
+        "+def f():\n"
+        "+    return 1\n"
+        "+\n"
+    )
+    blocks = _parse_added_blocks(diff_text, min_lines=1)
+    assert len(blocks) == 1
+    assert blocks[0].path == "new.py"
+    assert blocks[0].start_line == 1
+    assert blocks[0].end_line == 3
+    assert "def f():" in blocks[0].text
+
+
+def test_detect_clones_in_diff_flags_duplicate(tmp_path: Path) -> None:
+    pygit2 = pytest.importorskip("pygit2")
+    body = (
+        "def sum_items(items):\n"
+        "    total = 0\n"
+        "    for item in items:\n"
+        "        total = total + item\n"
+        "    return total\n"
+    )
+    pygit2.init_repository(str(tmp_path))
+    (tmp_path / "orig.py").write_text(body)
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embedder=HashingEmbedder())
+
+    # A brand-new file re-implementing the same function (intent-to-add so it
+    # shows up in `git diff`); it is NOT in the index, so no self-match.
+    (tmp_path / "copy.py").write_text(body)
+    import subprocess
+
+    subprocess.run(["git", "add", "-N", "copy.py"], cwd=tmp_path, check=True)
+
+    findings = SearchEngine(tmp_path, db_path=db).detect_clones_in_diff(min_lines=3, similarity=0.95)
+    assert findings
+    assert findings[0].added_path == "copy.py"
+    assert findings[0].matches.name == "sum_items"
+    assert findings[0].matches.path == "orig.py"
+    assert findings[0].similarity >= 0.95
+
+
+def test_detect_clones_in_diff_clean_when_no_duplication(tmp_path: Path) -> None:
+    pygit2 = pytest.importorskip("pygit2")
+    pygit2.init_repository(str(tmp_path))
+    (tmp_path / "orig.py").write_text("def sum_items(items):\n    return sum(items)\n")
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embedder=HashingEmbedder())
+
+    (tmp_path / "fresh.py").write_text(
+        "def render_html_table(rows):\n"
+        "    cells = [str(value).upper() for row in rows for value in row]\n"
+        "    return '<table>' + ''.join(cells) + '</table>'\n"
+    )
+    import subprocess
+
+    subprocess.run(["git", "add", "-N", "fresh.py"], cwd=tmp_path, check=True)
+
+    findings = SearchEngine(tmp_path, db_path=db).detect_clones_in_diff(min_lines=3, similarity=0.95)
+    assert findings == []
+
+
 def test_search_tools_registered() -> None:
     from codescope.cli import register_codescope_tools
 
@@ -141,5 +212,12 @@ def test_search_tools_registered() -> None:
     from serena.tools import ToolRegistry
 
     names = ToolRegistry().get_tool_names()
-    for t in ("search_code", "search_semantic", "search_regex", "find_similar_code", "find_duplicate_code"):
+    for t in (
+        "search_code",
+        "search_semantic",
+        "search_regex",
+        "find_similar_code",
+        "find_duplicate_code",
+        "detect_clones_in_diff",
+    ):
         assert t in names

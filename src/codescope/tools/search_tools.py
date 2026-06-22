@@ -126,3 +126,35 @@ class FindDuplicateCodeTool(Tool, ToolMarkerSymbolicRead):
             min_lines=min_lines, similarity=similarity, limit=limit
         )
         return self._to_json([asdict(g) for g in groups])
+
+
+class DetectClonesInDiffTool(Tool, ToolMarkerSymbolicRead):
+    """
+    Check whether newly added (diff) code duplicates code already in the index.
+
+    A pre-commit / pre-write gate for the "reuse before write" workflow: scans
+    the git diff for blocks of added lines and reports any block that closely
+    matches an existing indexed symbol, so duplication is caught before it
+    lands. Untracked files must be staged (git add) or marked intent-to-add
+    (git add -N) to show up. Requires an embeddings index (see reindex).
+    """
+
+    def apply(
+        self, staged: bool = False, min_lines: int = 5, similarity: float = 0.85, limit: int = 50
+    ) -> str:
+        """
+        Report added diff blocks that duplicate existing code.
+
+        :param staged: diff staged changes instead of the working tree.
+        :param min_lines: ignore added blocks shorter than this many lines.
+        :param similarity: cosine threshold for an added block to count as a
+            duplicate (higher == stricter).
+        :param limit: maximum number of findings to return.
+        :return: JSON list of findings, each with the added block's path and
+            line range, the similarity score, and the existing symbol it
+            duplicates (``matches``).
+        """
+        findings = SearchEngine(self.get_project_root()).detect_clones_in_diff(
+            staged=staged, min_lines=min_lines, similarity=similarity, limit=limit
+        )
+        return self._to_json([asdict(f) for f in findings])

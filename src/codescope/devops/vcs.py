@@ -88,6 +88,72 @@ def diff(cwd: str | Path, *, staged: bool = False, max_chars: int = 20000) -> st
     return out[:max_chars]
 
 
+@dataclass(slots=True)
+class DiffBlock:
+    """A run of contiguous added lines in a unified diff (new-file coordinates)."""
+
+    path: str
+    start_line: int
+    end_line: int
+    text: str
+
+
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def _parse_added_blocks(diff_text: str, min_lines: int) -> list[DiffBlock]:
+    """Extract contiguous added-line blocks from unified ``git diff`` output."""
+    blocks: list[DiffBlock] = []
+    path: str | None = None
+    new_line = 0
+    buf: list[str] = []
+    buf_start = 0
+
+    def flush() -> None:
+        nonlocal buf
+        if path and len(buf) >= min_lines:
+            blocks.append(
+                DiffBlock(path=path, start_line=buf_start, end_line=buf_start + len(buf) - 1, text="\n".join(buf))
+            )
+        buf = []
+
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            flush()
+            target = line[4:].strip()
+            path = None if target == "/dev/null" else target[2:] if target.startswith("b/") else target
+            continue
+        if line.startswith(("--- ", "diff ", "index ")):
+            flush()
+            continue
+        m = _HUNK_RE.match(line)
+        if m:
+            flush()
+            new_line = int(m.group(1))
+            continue
+        if line.startswith("+"):
+            if not buf:
+                buf_start = new_line
+            buf.append(line[1:])
+            new_line += 1
+        elif line.startswith("-"):
+            flush()
+        else:  # context line (leading space) or blank
+            flush()
+            new_line += 1
+    flush()
+    return blocks
+
+
+def added_blocks(cwd: str | Path, *, staged: bool = False, min_lines: int = 1) -> list[DiffBlock]:
+    """Blocks of newly added lines in the working tree (or staged) diff.
+
+    Note: untracked files only appear once staged (``git add``) or marked
+    intent-to-add (``git add -N``).
+    """
+    return _parse_added_blocks(diff(cwd, staged=staged, max_chars=200000), min_lines)
+
+
 def commit(cwd: str | Path, message: str, *, add_all: bool = False) -> CommitResult:
     cleaned, was_sanitized = sanitize_message(message)
     if add_all:
