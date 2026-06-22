@@ -87,6 +87,53 @@ def test_embedder_from_id_roundtrip() -> None:
     assert a == b
 
 
+def test_find_similar_code_finds_matching_symbol(indexed: tuple[Path, Path]) -> None:
+    root, db = indexed
+    snippet = "def validate_token(token):\n    return verify_signature(token)\n"
+    hits = SearchEngine(root, db_path=db).find_similar_code(snippet, limit=5)
+    assert hits
+    assert hits[0].name == "validate_token"
+    assert -1.0 <= hits[0].score <= 1.0
+
+
+@pytest.fixture
+def indexed_with_clones(tmp_path: Path) -> tuple[Path, Path]:
+    body = (
+        "def {name}(items):\n"
+        "    total = 0\n"
+        "    for item in items:\n"
+        "        total = total + item\n"
+        "    return total\n"
+    )
+    (tmp_path / "a.py").write_text(body.format(name="sum_items"))
+    (tmp_path / "b.py").write_text(body.format(name="sum_items"))
+    (tmp_path / "c.py").write_text(
+        "def unrelated(path):\n"
+        "    with open(path) as f:\n"
+        "        return f.read().upper()\n"
+    )
+    db = tmp_path / "idx" / "index.db"
+    report = Indexer(tmp_path, db_path=db).reindex(embedder=HashingEmbedder())
+    assert report.errors == 0
+    return tmp_path, db
+
+
+def test_find_duplicate_code_groups_clones(indexed_with_clones: tuple[Path, Path]) -> None:
+    root, db = indexed_with_clones
+    groups = SearchEngine(root, db_path=db).find_duplicate_code(min_lines=3, similarity=0.95)
+    assert groups
+    paths = {m.path for m in groups[0].members}
+    assert "a.py" in paths and "b.py" in paths
+    assert all(m.lines >= 3 for m in groups[0].members)
+    assert groups[0].similarity >= 0.95
+
+
+def test_find_duplicate_code_respects_min_lines(indexed_with_clones: tuple[Path, Path]) -> None:
+    root, db = indexed_with_clones
+    # The clone bodies are 5 lines; a min_lines of 100 excludes everything.
+    assert SearchEngine(root, db_path=db).find_duplicate_code(min_lines=100) == []
+
+
 def test_search_tools_registered() -> None:
     from codescope.cli import register_codescope_tools
 
@@ -94,5 +141,5 @@ def test_search_tools_registered() -> None:
     from serena.tools import ToolRegistry
 
     names = ToolRegistry().get_tool_names()
-    for t in ("search_code", "search_semantic", "search_regex"):
+    for t in ("search_code", "search_semantic", "search_regex", "find_similar_code", "find_duplicate_code"):
         assert t in names

@@ -29,6 +29,10 @@ log = logging.getLogger(__name__)
 def _encode_vector(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
+
+def _decode_vector(blob: bytes) -> list[float]:
+    return list(struct.unpack(f"{len(blob) // 4}f", blob))
+
 SCHEMA_VERSION = 1
 
 _SCHEMA = """
@@ -181,6 +185,24 @@ class IndexStore:
         return self.conn.execute(
             "SELECT sid, distance FROM chunks_vec WHERE embedding MATCH ? AND k=? ORDER BY distance",
             (_encode_vector(query_vec), k),
+        ).fetchall()
+
+    def get_embedding(self, sid: int) -> list[float] | None:
+        """Return the stored embedding for a symbol id, or None."""
+        if not self.has_vectors():
+            return None
+        row = self.conn.execute("SELECT embedding FROM chunks_vec WHERE sid=?", (sid,)).fetchone()
+        return _decode_vector(row[0]) if row else None
+
+    def symbols_with_min_lines(self, min_lines: int) -> list[tuple[int, str, str, str, int, int, str]]:
+        """Symbols whose body spans at least ``min_lines`` lines.
+
+        :return: ``(id, name, kind, path, start_line, end_line, signature)`` rows.
+        """
+        return self.conn.execute(
+            "SELECT id, name, kind, path, start_line, end_line, signature FROM symbols "
+            "WHERE (end_line - start_line + 1) >= ?",
+            (min_lines,),
         ).fetchall()
 
     def _vec_table_exists(self) -> bool:

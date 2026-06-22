@@ -27,6 +27,14 @@ RRF_K = 60
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+")
 
 
+def _cosine_from_l2(distance: float) -> float:
+    """Cosine similarity from sqlite-vec's L2 distance over L2-normalized vectors.
+
+    For unit vectors ``|a-b|^2 == 2 - 2*cos``, so ``cos == 1 - d^2/2``.
+    """
+    return max(-1.0, min(1.0, 1.0 - (distance * distance) / 2.0))
+
+
 @dataclass(slots=True)
 class SearchHit:
     name: str
@@ -44,6 +52,22 @@ class RegexHit:
     path: str
     line: int
     text: str
+
+
+@dataclass(slots=True)
+class CloneMember:
+    name: str
+    kind: str
+    path: str
+    start_line: int
+    end_line: int
+    lines: int
+
+
+@dataclass(slots=True)
+class CloneGroup:
+    members: list[CloneMember]
+    similarity: float  # mean pairwise similarity within the cluster
 
 
 def _fts_or_query(query: str) -> str | None:
@@ -196,3 +220,112 @@ class SearchEngine:
             if len(hits) >= limit:
                 break
         return hits
+
+    # -- reuse / clone detection ------------------------------------------
+
+    def find_similar_code(self, snippet: str, limit: int = 10) -> list[SearchHit]:
+        """Find indexed symbols whose code is most similar to ``snippet``.
+
+        The inverse of ``semantic_search``: instead of a natural-language query
+        you pass a *code snippet* (the block you are about to write) and get the
+        nearest existing symbols by vector similarity - the "reuse before write"
+        lookup. Returns [] when no embeddings are indexed.
+        """
+        with IndexStore(self.db_path) as store:
+            if not store.has_vectors():
+                return []
+            embedder_id = store.get_meta("embedder_id")
+            if not embedder_id:
+                return []
+            try:
+                embedder = embedder_from_id(embedder_id)
+            except Exception:
+                return []
+            qvec = embedder.embed_documents([snippet])[0]
+            results = store.vector_search(qvec, limit)
+            hits = self._fetch_symbols(store, [sid for sid, _ in results])
+        ordered: list[SearchHit] = []
+        for sid, dist in results:
+            hit = hits.get(sid)
+            if hit is None:
+                continue
+            hit.score = round(_cosine_from_l2(dist), 6)
+            hit.sources = ["vector"]
+            ordered.append(hit)
+        return ordered
+
+    def find_duplicate_code(
+        self, min_lines: int = 5, similarity: float = 0.9, limit: int = 50
+    ) -> list[CloneGroup]:
+        """Cluster near-duplicate symbol bodies across the codebase.
+
+        Embeds every symbol spanning at least ``min_lines`` lines (already done
+        at index time) and links any pair whose cosine similarity is at least
+        ``similarity`` into the same clone group via union-find. Surfaces copy-
+        paste that ``find_symbol`` / lexical search miss. Returns [] when no
+        embeddings are indexed.
+
+        :param min_lines: ignore symbols shorter than this (skips trivial code).
+        :param similarity: cosine threshold in [0, 1] for two symbols to count
+            as duplicates (1.0 == identical embedding).
+        :param limit: maximum number of clone groups to return.
+        """
+        neighbor_k = 16
+        with IndexStore(self.db_path) as store:
+            if not store.has_vectors():
+                return []
+            rows = store.symbols_with_min_lines(min_lines)
+            meta = {
+                r[0]: CloneMember(
+                    name=r[1], kind=r[2], path=r[3], start_line=r[4], end_line=r[5], lines=r[5] - r[4] + 1
+                )
+                for r in rows
+            }
+            parent: dict[int, int] = {sid: sid for sid in meta}
+            pair_sims: dict[tuple[int, int], float] = {}
+
+            def find(x: int) -> int:
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            def union(a: int, b: int) -> None:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[rb] = ra
+
+            for sid in meta:
+                vec = store.get_embedding(sid)
+                if vec is None:
+                    continue
+                for nsid, dist in store.vector_search(vec, neighbor_k):
+                    if nsid == sid or nsid not in meta:
+                        continue
+                    sim = _cosine_from_l2(dist)
+                    if sim < similarity:
+                        continue
+                    union(sid, nsid)
+                    pair_sims[(min(sid, nsid), max(sid, nsid))] = sim
+
+        clusters: dict[int, list[int]] = {}
+        for sid in meta:
+            clusters.setdefault(find(sid), []).append(sid)
+
+        groups: list[CloneGroup] = []
+        for sids in clusters.values():
+            if len(sids) < 2:
+                continue
+            sims = [
+                s
+                for (a, b), s in pair_sims.items()
+                if a in sids and b in sids
+            ]
+            mean_sim = sum(sims) / len(sims) if sims else similarity
+            members = sorted(
+                (meta[sid] for sid in sids), key=lambda m: (m.path, m.start_line)
+            )
+            groups.append(CloneGroup(members=members, similarity=round(mean_sim, 6)))
+
+        groups.sort(key=lambda g: (len(g.members), g.similarity), reverse=True)
+        return groups[:limit]

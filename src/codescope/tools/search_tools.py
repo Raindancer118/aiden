@@ -73,3 +73,56 @@ class SearchRegexTool(Tool, ToolMarkerSymbolicRead):
         """
         hits = SearchEngine(self.get_project_root()).regex_search(pattern, limit=limit)
         return self._to_json([asdict(h) for h in hits])
+
+
+class FindSimilarCodeTool(Tool, ToolMarkerSymbolicRead):
+    """
+    Find existing code most similar to a code snippet ("reuse before you write").
+
+    The inverse of search_semantic: instead of a natural-language query you pass
+    the *code block you are about to write*, and this returns the nearest
+    existing symbols by vector similarity. Use it before adding a new function,
+    helper, or test to check whether the project already has (almost) the same
+    thing. Requires the index to be built with embeddings (see reindex).
+    """
+
+    def apply(self, snippet: str, limit: int = 10) -> str:
+        """
+        Find indexed symbols whose code is closest to ``snippet``.
+
+        :param snippet: the code block to compare against the codebase.
+        :param limit: maximum number of results to return.
+        :return: JSON list of matching symbols ranked by cosine similarity
+            (``score`` is the similarity in [-1, 1]; 1.0 == identical).
+        """
+        hits = SearchEngine(self.get_project_root()).find_similar_code(snippet, limit=limit)
+        return self._to_json([asdict(h) for h in hits])
+
+
+class FindDuplicateCodeTool(Tool, ToolMarkerSymbolicRead):
+    """
+    Detect near-duplicate (copy-pasted) code blocks across the whole codebase.
+
+    Clusters indexed symbols whose bodies are semantically near-identical into
+    clone groups (like jscpd / PMD-CPD, but embedding-based and language-
+    agnostic). Use it to find refactoring opportunities and accidental
+    duplication that name- and keyword-based search miss. Requires the index to
+    be built with embeddings (see reindex).
+    """
+
+    def apply(self, min_lines: int = 5, similarity: float = 0.9, limit: int = 50) -> str:
+        """
+        Report groups of duplicate / near-duplicate symbols.
+
+        :param min_lines: ignore symbols shorter than this many lines (skips
+            trivial getters/one-liners).
+        :param similarity: cosine threshold in [0, 1] for two symbols to be
+            considered duplicates (higher == stricter; 1.0 == identical).
+        :param limit: maximum number of clone groups to return.
+        :return: JSON list of clone groups, each with its members (name, kind,
+            path, line range, line count) and the mean pairwise similarity.
+        """
+        groups = SearchEngine(self.get_project_root()).find_duplicate_code(
+            min_lines=min_lines, similarity=similarity, limit=limit
+        )
+        return self._to_json([asdict(g) for g in groups])
