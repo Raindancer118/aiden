@@ -24,7 +24,9 @@ class ScaffoldResult:
 
 def _module_name(name: str) -> str:
     mod = re.sub(r"[^0-9a-zA-Z]+", "_", name).strip("_").lower()
-    return mod or "app"
+    if not mod:
+        return "app"
+    return f"_{mod}" if mod[0].isdigit() else mod
 
 
 def _python_template(name: str) -> dict[str, str]:
@@ -38,7 +40,7 @@ def _python_template(name: str) -> dict[str, str]:
             'requires-python = ">=3.11"\n'
             "dependencies = []\n\n"
             "[project.scripts]\n"
-            f'{name} = "{mod}.main:main"\n\n'
+            f'"{name}" = "{mod}.main:main"\n\n'
             "[build-system]\n"
             'requires = ["hatchling"]\n'
             'build-backend = "hatchling.build"\n\n'
@@ -51,18 +53,10 @@ def _python_template(name: str) -> dict[str, str]:
             'testpaths = ["tests"]\n'
         ),
         f"src/{mod}/__init__.py": '__version__ = "0.1.0"\n',
-        f"src/{mod}/main.py": (
-            "def main() -> None:\n"
-            f'    print("Hello from {name}")\n\n\n'
-            'if __name__ == "__main__":\n'
-            "    main()\n"
-        ),
+        f"src/{mod}/main.py": (f'def main() -> None:\n    print("Hello from {name}")\n\n\nif __name__ == "__main__":\n    main()\n'),
         "tests/__init__.py": "",
         "tests/test_main.py": (
-            f"from {mod}.main import main\n\n\n"
-            "def test_main_runs(capsys):\n"
-            "    main()\n"
-            "    assert capsys.readouterr().out\n"
+            f"from {mod}.main import main\n\n\ndef test_main_runs(capsys):\n    main()\n    assert capsys.readouterr().out\n"
         ),
         ".gitignore": "__pycache__/\n*.py[cod]\n.venv/\ndist/\nbuild/\n*.egg-info/\n.pytest_cache/\n.mypy_cache/\n",
         "README.md": f"# {name}\n\n```bash\nuv sync\nuv run pytest\nuv run {name}\n```\n",
@@ -70,10 +64,11 @@ def _python_template(name: str) -> dict[str, str]:
 
 
 def _node_template(name: str) -> dict[str, str]:
+    package_name = name.lower()
     return {
         "package.json": (
             "{\n"
-            f'  "name": "{name}",\n'
+            f'  "name": "{package_name}",\n'
             '  "version": "0.1.0",\n'
             '  "type": "module",\n'
             '  "scripts": {\n'
@@ -117,13 +112,7 @@ def _node_template(name: str) -> dict[str, str]:
 def _rust_template(name: str) -> dict[str, str]:
     crate = _module_name(name)
     return {
-        "Cargo.toml": (
-            "[package]\n"
-            f'name = "{crate}"\n'
-            'version = "0.1.0"\n'
-            'edition = "2021"\n\n'
-            "[dependencies]\n"
-        ),
+        "Cargo.toml": (f'[package]\nname = "{crate}"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n'),
         "src/lib.rs": (
             "pub fn add(a: i64, b: i64) -> i64 {\n"
             "    a + b\n"
@@ -149,10 +138,15 @@ def create_project(stack: str, name: str, dest_dir: str | Path, *, git_init: boo
     stack = stack.lower()
     if stack not in _TEMPLATES:
         raise ValueError(f"Unsupported stack {stack!r}. Supported: {', '.join(SUPPORTED_STACKS)}")
-    if not re.match(r"^[A-Za-z0-9._-]+$", name):
-        raise ValueError("Project name may only contain letters, digits, '.', '_' and '-'.")
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", name):
+        raise ValueError("Project name must start and end with a letter or digit and may contain '.', '_' and '-'.")
 
-    target = Path(dest_dir).expanduser().resolve() / name
+    parent = Path(dest_dir).expanduser().resolve()
+    target = parent / name
+    if target.is_symlink():
+        raise FileExistsError(f"Target directory must not be a symbolic link: {target}")
+    if target.resolve().parent != parent:
+        raise ValueError(f"Target directory escapes its destination parent: {target}")
     if target.exists() and any(target.iterdir()):
         raise FileExistsError(f"Target directory is not empty: {target}")
 

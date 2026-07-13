@@ -33,6 +33,7 @@ def _encode_vector(vec: list[float]) -> bytes:
 def _decode_vector(blob: bytes) -> list[float]:
     return list(struct.unpack(f"{len(blob) // 4}f", blob))
 
+
 SCHEMA_VERSION = 1
 
 _SCHEMA = """
@@ -126,8 +127,7 @@ class IndexStore:
     def _init_schema(self) -> None:
         self.conn.executescript(_SCHEMA)
         self.conn.execute(
-            "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            "INSERT INTO meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(SCHEMA_VERSION),),
         )
         self.conn.commit()
@@ -147,13 +147,17 @@ class IndexStore:
     # -- vector table -----------------------------------------------------
 
     def ensure_vec_table(self, dim: int, embedder_id: str) -> bool:
-        """Create the sqlite-vec table for ``dim`` if needed. Returns success."""
+        """Create the sqlite-vec table for ``dim`` if needed. Returns success.
+
+        Only safe to call when the embedder has not changed (see
+        :meth:`embedder_changed`) or when no vectors exist yet: on an actual
+        embedder change, use :meth:`rebuild_vec_table` instead, since a bare
+        ``DROP TABLE`` here would destroy the previous vectors via an
+        auto-committing DDL statement before new ones are known to be
+        computable.
+        """
         if not self.vec_enabled:
             return False
-        existing = self.get_meta("embedder_dim")
-        if existing is not None and int(existing) != dim:
-            # Embedder changed: drop stale vectors so dimensions stay consistent.
-            self.conn.execute("DROP TABLE IF EXISTS chunks_vec")
         self.conn.execute(
             f"CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0("
             f"sid integer primary key, embedding float[{dim}], +path text, +lang text)"
@@ -161,6 +165,43 @@ class IndexStore:
         self.set_meta("embedder_dim", str(dim))
         self.set_meta("embedder_id", embedder_id)
         return True
+
+    def embedder_changed(self, dim: int, embedder_id: str) -> bool:
+        """Whether ``dim``/``embedder_id`` differ from the currently stored vectors."""
+        existing_dim = self.get_meta("embedder_dim")
+        existing_id = self.get_meta("embedder_id")
+        return existing_dim is not None and (int(existing_dim) != dim or existing_id != embedder_id)
+
+    def rebuild_vec_table(self, dim: int, embedder_id: str, rows: list[tuple[int, list[float], str, str]]) -> None:
+        """Replace the vector table with a freshly embedded set.
+
+        Callers must compute ``rows`` (i.e. run the embedder over every
+        symbol) *before* calling this method: that embedding step is the part
+        that can fail (backend errors, network, etc.), and once it has
+        succeeded, replacing the table is pure, fast, local SQL. This ordering
+        is what keeps a failing embedder from destroying the previous, working
+        vector table -- unlike a naive drop-then-embed sequence, where the
+        auto-committing ``DROP TABLE`` DDL can't be undone by a rollback once
+        the embedding call raises.
+
+        A rename-based staged swap was considered but rejected: sqlite-vec's
+        ``vec0`` virtual table manages shadow tables that a plain
+        ``ALTER TABLE ... RENAME TO`` does not follow, breaking the renamed
+        table.
+        """
+        if not self.vec_enabled:
+            return
+        self.conn.execute("DROP TABLE IF EXISTS chunks_vec")
+        self.conn.execute(
+            f"CREATE VIRTUAL TABLE chunks_vec USING vec0(sid integer primary key, embedding float[{dim}], +path text, +lang text)"
+        )
+        if rows:
+            self.conn.executemany(
+                "INSERT INTO chunks_vec(sid, embedding, path, lang) VALUES(?,?,?,?)",
+                [(sid, _encode_vector(vec), path, lang) for sid, vec, path, lang in rows],
+            )
+        self.set_meta("embedder_dim", str(dim))
+        self.set_meta("embedder_id", embedder_id)
 
     def has_vectors(self) -> bool:
         if not self.vec_enabled:
@@ -194,14 +235,32 @@ class IndexStore:
         row = self.conn.execute("SELECT embedding FROM chunks_vec WHERE sid=?", (sid,)).fetchone()
         return _decode_vector(row[0]) if row else None
 
+    def all_symbol_rows_for_embedding(self) -> list[tuple[int, str, str, str]]:
+        """Return ``(sid, body, path, lang)`` for every indexed symbol."""
+        return self.conn.execute(
+            "SELECT s.id, f.body, s.path, files.lang "
+            "FROM symbols AS s "
+            "JOIN symbols_fts AS f ON f.rowid = s.id "
+            "JOIN files ON files.path = s.path "
+            "ORDER BY s.id"
+        ).fetchall()
+
+    def symbols_without_embeddings(self) -> list[tuple[int, str, str, str]]:
+        """Return ``(sid, body, path, lang)`` for symbols missing a vector."""
+        rows = self.all_symbol_rows_for_embedding()
+        if not self._vec_table_exists():
+            return rows
+
+        embedded_ids = {row[0] for row in self.conn.execute("SELECT sid FROM chunks_vec")}
+        return [row for row in rows if row[0] not in embedded_ids]
+
     def symbols_with_min_lines(self, min_lines: int) -> list[tuple[int, str, str, str, int, int, str]]:
         """Symbols whose body spans at least ``min_lines`` lines.
 
         :return: ``(id, name, kind, path, start_line, end_line, signature)`` rows.
         """
         return self.conn.execute(
-            "SELECT id, name, kind, path, start_line, end_line, signature FROM symbols "
-            "WHERE (end_line - start_line + 1) >= ?",
+            "SELECT id, name, kind, path, start_line, end_line, signature FROM symbols WHERE (end_line - start_line + 1) >= ?",
             (min_lines,),
         ).fetchall()
 
@@ -251,31 +310,37 @@ class IndexStore:
             symbols, so the caller can batch-embed bodies afterwards.
         """
         cur = self.conn.cursor()
-        self.delete_file(path)
-        cur.execute(
-            "INSERT INTO files(path, lang, hash, mtime, size, indexed_at) VALUES(?,?,?,?,?,?)",
-            (path, lang, file_hash, mtime, size, indexed_at),
-        )
-        inserted: list[tuple[int, str, str, str]] = []
-        for s in symbols:
+        cur.execute("SAVEPOINT codescope_upsert_file")
+        try:
+            self.delete_file(path)
             cur.execute(
-                "INSERT INTO symbols(path, name, kind, start_line, start_col, end_line, end_col, signature) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (path, s.name, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.signature),
+                "INSERT INTO files(path, lang, hash, mtime, size, indexed_at) VALUES(?,?,?,?,?,?)",
+                (path, lang, file_hash, mtime, size, indexed_at),
             )
-            sid = cur.lastrowid
-            assert sid is not None
-            cur.execute(
-                "INSERT INTO symbols_fts(rowid, name, path, body, kind) VALUES(?,?,?,?,?)",
-                (sid, s.name, path, s.body, s.kind),
-            )
-            cur.execute("INSERT INTO symbols_trgm(rowid, body) VALUES(?,?)", (sid, s.body))
-            inserted.append((sid, s.body, path, lang))
-        if refs:
-            cur.executemany(
-                "INSERT INTO refs(path, name, kind, line, col) VALUES(?,?,?,?,?)",
-                [(path, r.name, r.kind, r.line, r.col) for r in refs],
-            )
+            inserted: list[tuple[int, str, str, str]] = []
+            for s in symbols:
+                cur.execute(
+                    "INSERT INTO symbols(path, name, kind, start_line, start_col, end_line, end_col, signature) VALUES(?,?,?,?,?,?,?,?)",
+                    (path, s.name, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.signature),
+                )
+                sid = cur.lastrowid
+                assert sid is not None
+                cur.execute(
+                    "INSERT INTO symbols_fts(rowid, name, path, body, kind) VALUES(?,?,?,?,?)",
+                    (sid, s.name, path, s.body, s.kind),
+                )
+                cur.execute("INSERT INTO symbols_trgm(rowid, body) VALUES(?,?)", (sid, s.body))
+                inserted.append((sid, s.body, path, lang))
+            if refs:
+                cur.executemany(
+                    "INSERT INTO refs(path, name, kind, line, col) VALUES(?,?,?,?,?)",
+                    [(path, r.name, r.kind, r.line, r.col) for r in refs],
+                )
+        except Exception:
+            cur.execute("ROLLBACK TO SAVEPOINT codescope_upsert_file")
+            cur.execute("RELEASE SAVEPOINT codescope_upsert_file")
+            raise
+        cur.execute("RELEASE SAVEPOINT codescope_upsert_file")
         return inserted
 
     def commit(self) -> None:

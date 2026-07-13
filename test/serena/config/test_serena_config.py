@@ -579,9 +579,13 @@ class TestMemoriesManagerCustomPath:
     def teardown_method(self):
         shutil.rmtree(self.test_dir)
 
-    def test_memories_subdir_is_created(self):
+    def test_memories_subdir_is_created_only_when_written(self):
         assert not self.data_folder.exists()
-        MemoryManager(str(self.data_folder))
+        manager = MemoryManager(str(self.data_folder))
+        assert not (self.data_folder / "memories").exists()
+
+        manager.save_memory("test_topic", "test content", is_tool_context=False)
+
         assert (self.data_folder / "memories").exists()
 
     def test_save_and_load_memory(self):

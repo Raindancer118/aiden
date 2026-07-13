@@ -52,6 +52,45 @@ def test_call_chain(graph: GraphEngine) -> None:
     assert any(gc.name == "transform" for gc in process_node.children)
 
 
+def test_call_chain_expands_shared_dependency_on_each_branch(tmp_path: Path) -> None:
+    (tmp_path / "diamond.py").write_text(
+        "def root():\n"
+        "    left()\n"
+        "    right()\n"
+        "\n"
+        "def left():\n"
+        "    shared()\n"
+        "\n"
+        "def right():\n"
+        "    shared()\n"
+        "\n"
+        "def shared():\n"
+        "    leaf()\n"
+        "\n"
+        "def leaf():\n"
+        "    return 1\n"
+    )
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embeddings=False)
+
+    tree = GraphEngine(tmp_path, db_path=db).call_chain("root", depth=4)
+    for branch_name in ("left", "right"):
+        branch = next(child for child in tree.children if child.name == branch_name)
+        shared = next(child for child in branch.children if child.name == "shared")
+        assert [child.name for child in shared.children] == ["leaf"]
+
+
+def test_call_chain_does_not_merge_same_named_symbol_bodies(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("def run():\n    alpha()\n\ndef alpha():\n    pass\n")
+    (tmp_path / "b.py").write_text("def run():\n    beta()\n\ndef beta():\n    pass\n")
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embeddings=False)
+
+    tree = GraphEngine(tmp_path, db_path=db).call_chain("run", depth=2)
+    assert tree.path == "a.py"
+    assert {child.name for child in tree.children} == {"alpha"}
+
+
 def test_change_impact(graph: GraphEngine) -> None:
     tree = graph.change_impact("read_source", depth=4)
     # read_source <- load <- main

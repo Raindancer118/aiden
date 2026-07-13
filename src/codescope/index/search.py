@@ -13,6 +13,8 @@ BM25 scores with vector distances.
 
 from __future__ import annotations
 
+import base64
+import json
 import re
 import shutil
 import subprocess
@@ -87,6 +89,22 @@ def _fts_or_query(query: str) -> str | None:
     return " OR ".join(f'"{t}"' for t in tokens)
 
 
+def _fts_phrase(value: str) -> str:
+    """Build a quoted FTS5 phrase with embedded quotes escaped."""
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _decode_rg_field(field: dict[str, str]) -> str:
+    """Decode a ripgrep JSON text-or-base64 field."""
+    text = field.get("text")
+    if text is not None:
+        return text
+    encoded = field.get("bytes")
+    if encoded is None:
+        return ""
+    return base64.b64decode(encoded).decode("utf-8", errors="replace")
+
+
 class SearchEngine:
     def __init__(self, project_root: str | Path, db_path: str | Path | None = None):
         self.root = Path(project_root).resolve()
@@ -112,17 +130,17 @@ class SearchEngine:
             return []
         try:
             embedder = embedder_from_id(embedder_id)
+            qvec = embedder.embed_query(query)
+            return [sid for sid, _dist in store.vector_search(qvec, k)]
         except Exception:
             return []
-        qvec = embedder.embed_query(query)
-        return [sid for sid, _dist in store.vector_search(qvec, k)]
 
     def _trigram_ids(self, store: IndexStore, substring: str, k: int) -> list[int]:
-        if len(substring) < 3:
+        if len(substring) < 3 or not substring.strip() or k <= 0:
             return []
         rows = store.conn.execute(
             "SELECT rowid FROM symbols_trgm WHERE symbols_trgm MATCH ? LIMIT ?",
-            (f'"{substring}"', k),
+            (_fts_phrase(substring), k),
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -135,10 +153,7 @@ class SearchEngine:
             sids,
         ).fetchall()
         return {
-            r[0]: SearchHit(
-                name=r[1], kind=r[2], path=r[3], start_line=r[4], end_line=r[5], signature=r[6] or "", score=0.0
-            )
-            for r in rows
+            r[0]: SearchHit(name=r[1], kind=r[2], path=r[3], start_line=r[4], end_line=r[5], signature=r[6] or "", score=0.0) for r in rows
         }
 
     @staticmethod
@@ -155,6 +170,8 @@ class SearchEngine:
 
     def hybrid_search(self, query: str, limit: int = 10) -> list[SearchHit]:
         """BM25 + vector + trigram fused via RRF. The flagship search."""
+        if not query.strip() or limit <= 0:
+            return []
         pool = max(limit * 5, 30)
         with IndexStore(self.db_path) as store:
             rankings = {
@@ -180,6 +197,8 @@ class SearchEngine:
 
     def semantic_search(self, query: str, limit: int = 10) -> list[SearchHit]:
         """Pure vector search (falls back to BM25 if no vectors are indexed)."""
+        if not query.strip() or limit <= 0:
+            return []
         with IndexStore(self.db_path) as store:
             ids = self._vector_ids(store, query, limit)
             source = "vector"
@@ -199,6 +218,8 @@ class SearchEngine:
 
     def substring_search(self, substring: str, limit: int = 20) -> list[SearchHit]:
         """Trigram-accelerated substring search over symbol bodies."""
+        if limit <= 0:
+            return []
         with IndexStore(self.db_path) as store:
             ids = self._trigram_ids(store, substring, limit)
             hits = self._fetch_symbols(store, ids)
@@ -206,26 +227,38 @@ class SearchEngine:
 
     def regex_search(self, pattern: str, limit: int = 50) -> list[RegexHit]:
         """Full regex over file contents using ripgrep (line-level hits)."""
+        if not pattern or limit <= 0:
+            return []
         rg = shutil.which("rg")
         if rg is None:
             raise RuntimeError("ripgrep (rg) is not installed; regex search is unavailable.")
         proc = subprocess.run(
-            [rg, "--no-heading", "--line-number", "--color", "never", "--max-count", "50", pattern, str(self.root)],
-            check=False, capture_output=True,
+            [rg, "--json", "--max-count", str(limit), pattern, str(self.root)],
+            check=False,
+            capture_output=True,
             text=True,
             timeout=30,
         )
+        if proc.returncode not in (0, 1):
+            detail = proc.stderr.strip() or f"exit status {proc.returncode}"
+            raise RuntimeError(f"ripgrep search failed: {detail}")
+
         hits: list[RegexHit] = []
         for line in proc.stdout.splitlines():
-            parts = line.split(":", 2)
-            if len(parts) < 3:
+            record = json.loads(line)
+            if record.get("type") != "match":
                 continue
-            path, lineno, text = parts
+            data = record["data"]
+            path = _decode_rg_field(data["path"])
+            line_number = data.get("line_number")
+            if not isinstance(line_number, int):
+                continue
+            matched_text = _decode_rg_field(data["lines"])
             try:
                 rel = str(Path(path).resolve().relative_to(self.root))
             except ValueError:
                 rel = path
-            hits.append(RegexHit(path=rel, line=int(lineno), text=text.strip()[:200]))
+            hits.append(RegexHit(path=rel, line=line_number, text=matched_text.strip()[:200]))
             if len(hits) >= limit:
                 break
         return hits
@@ -240,6 +273,8 @@ class SearchEngine:
         nearest existing symbols by vector similarity - the "reuse before write"
         lookup. Returns [] when no embeddings are indexed.
         """
+        if not snippet.strip() or limit <= 0:
+            return []
         with IndexStore(self.db_path) as store:
             if not store.has_vectors():
                 return []
@@ -248,10 +283,10 @@ class SearchEngine:
                 return []
             try:
                 embedder = embedder_from_id(embedder_id)
+                qvec = embedder.embed_documents([snippet])[0]
+                results = store.vector_search(qvec, limit)
             except Exception:
                 return []
-            qvec = embedder.embed_documents([snippet])[0]
-            results = store.vector_search(qvec, limit)
             hits = self._fetch_symbols(store, [sid for sid, _ in results])
         ordered: list[SearchHit] = []
         for sid, dist in results:
@@ -263,33 +298,29 @@ class SearchEngine:
             ordered.append(hit)
         return ordered
 
-    def find_duplicate_code(
-        self, min_lines: int = 5, similarity: float = 0.9, limit: int = 50
-    ) -> list[CloneGroup]:
+    def find_duplicate_code(self, min_lines: int = 5, similarity: float = 0.9, limit: int = 50) -> list[CloneGroup]:
         """Cluster near-duplicate symbol bodies across the codebase.
 
         Embeds every symbol spanning at least ``min_lines`` lines (already done
         at index time) and links any pair whose cosine similarity is at least
         ``similarity`` into the same clone group via union-find. Surfaces copy-
-        paste that ``find_symbol`` / lexical search miss. Returns [] when no
-        embeddings are indexed.
+        paste that ``find_symbol`` / lexical search miss. Raises clearly when
+        no embeddings are indexed so an empty result cannot be mistaken for a
+        successful clone audit.
 
         :param min_lines: ignore symbols shorter than this (skips trivial code).
         :param similarity: cosine threshold in [0, 1] for two symbols to count
             as duplicates (1.0 == identical embedding).
         :param limit: maximum number of clone groups to return.
         """
+        if limit <= 0:
+            return []
         neighbor_k = 16
         with IndexStore(self.db_path) as store:
             if not store.has_vectors():
-                return []
+                raise RuntimeError("Clone detection requires embeddings; run reindex with embeddings enabled")
             rows = store.symbols_with_min_lines(min_lines)
-            meta = {
-                r[0]: CloneMember(
-                    name=r[1], kind=r[2], path=r[3], start_line=r[4], end_line=r[5], lines=r[5] - r[4] + 1
-                )
-                for r in rows
-            }
+            meta = {r[0]: CloneMember(name=r[1], kind=r[2], path=r[3], start_line=r[4], end_line=r[5], lines=r[5] - r[4] + 1) for r in rows}
             parent: dict[int, int] = {sid: sid for sid in meta}
             pair_sims: dict[tuple[int, int], float] = {}
 
@@ -325,15 +356,9 @@ class SearchEngine:
         for sids in clusters.values():
             if len(sids) < 2:
                 continue
-            sims = [
-                s
-                for (a, b), s in pair_sims.items()
-                if a in sids and b in sids
-            ]
+            sims = [s for (a, b), s in pair_sims.items() if a in sids and b in sids]
             mean_sim = sum(sims) / len(sims) if sims else similarity
-            members = sorted(
-                (meta[sid] for sid in sids), key=lambda m: (m.path, m.start_line)
-            )
+            members = sorted((meta[sid] for sid in sids), key=lambda m: (m.path, m.start_line))
             groups.append(CloneGroup(members=members, similarity=round(mean_sim, 6)))
 
         groups.sort(key=lambda g: (len(g.members), g.similarity), reverse=True)
@@ -358,14 +383,18 @@ class SearchEngine:
             duplicate of an existing symbol.
         :param limit: maximum number of findings to return.
         """
+        if limit <= 0:
+            return []
         from codescope.devops import vcs
+
+        with IndexStore(self.db_path) as store:
+            if not store.has_vectors():
+                raise RuntimeError("Clone detection requires embeddings; run reindex with embeddings enabled")
 
         findings: list[DiffClone] = []
         for block in vcs.added_blocks(self.root, staged=staged, min_lines=min_lines):
             for hit in self.find_similar_code(block.text, limit=5):
-                same_block = hit.path == block.path and not (
-                    hit.end_line < block.start_line or hit.start_line > block.end_line
-                )
+                same_block = hit.path == block.path and not (hit.end_line < block.start_line or hit.start_line > block.end_line)
                 if same_block:
                     continue
                 if hit.score >= similarity:

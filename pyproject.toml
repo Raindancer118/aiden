@@ -21,6 +21,7 @@ dependencies = [
   "overrides==7.7.0",
   "python-dotenv==1.2.2",
   "mcp==1.27.0",
+  "anyio==4.13.0",                  # persistent MCP client for the mandatory Diary memory backend
   "flask==3.1.3", # bumped from 3.1.1 for CVE fix (also fixes werkzeug alert)
   "sensai-utils==1.5.0",
   "pydantic==2.12.5",
@@ -165,7 +166,7 @@ _ruff_fix = "ruff check --fix src scripts test"
 _ruff_format = "ruff format src scripts test"
 lint = ["_ruff_format_check", "_ruff_check"]
 format = ["_ruff_fix", "_ruff_format"]
-_mypy_core = "mypy src/serena src/solidlsp"
+_mypy_core = "mypy src/serena src/solidlsp src/codescope"
 _mypy_test = "mypy --disable-error-code no-untyped-def test"
 type-check = ["_mypy_core", "_mypy_test"]
 # docs

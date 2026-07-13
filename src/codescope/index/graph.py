@@ -89,11 +89,25 @@ class GraphEngine:
             out.append(SymbolRef(name=cname, kind=ckind, path=cpath, start_line=cline))
         return out
 
-    def _dependencies(self, store: IndexStore, name: str, defined: set[str]) -> list[SymbolRef]:
+    def _dependencies(
+        self,
+        store: IndexStore,
+        name: str,
+        defined: set[str],
+        *,
+        path: str | None = None,
+        start_line: int | None = None,
+    ) -> list[SymbolRef]:
         """Defined symbols referenced from within ``name``'s body (callees)."""
-        defs = store.conn.execute(
-            "SELECT path, start_line, end_line FROM symbols WHERE name=?", (name,)
-        ).fetchall()
+        if path is None or start_line is None:
+            defs = store.conn.execute(
+                "SELECT path, start_line, end_line FROM symbols WHERE name=? ORDER BY path, start_line", (name,)
+            ).fetchall()
+        else:
+            defs = store.conn.execute(
+                "SELECT path, start_line, end_line FROM symbols WHERE name=? AND path=? AND start_line=?",
+                (name, path, start_line),
+            ).fetchall()
         out: list[SymbolRef] = []
         seen: set[str] = set()
         for path, start, end in defs:
@@ -106,10 +120,12 @@ class GraphEngine:
                     continue
                 seen.add(refname)
                 target = store.conn.execute(
-                    "SELECT name, kind, path, start_line FROM symbols WHERE name=? LIMIT 1", (refname,)
+                    "SELECT name, kind, path, start_line, end_line FROM symbols WHERE name=? "
+                    "ORDER BY CASE WHEN path=? THEN 0 ELSE 1 END, path, start_line LIMIT 1",
+                    (refname, path),
                 ).fetchone()
                 if target:
-                    out.append(SymbolRef(name=target[0], kind=target[1], path=target[2], start_line=target[3]))
+                    out.append(SymbolRef(name=target[0], kind=target[1], path=target[2], start_line=target[3], end_line=target[4]))
         return out
 
     # -- public API -------------------------------------------------------
@@ -127,9 +143,11 @@ class GraphEngine:
         with IndexStore(self.db_path) as store:
             defined = self._defined_names(store)
             root_sym = store.conn.execute(
-                "SELECT name, kind, path, start_line FROM symbols WHERE name=? LIMIT 1", (name,)
+                "SELECT name, kind, path, start_line FROM symbols WHERE name=? ORDER BY path, start_line LIMIT 1", (name,)
             ).fetchone()
-            root = GraphNode(name=name, kind=root_sym[1] if root_sym else "?", path=root_sym[2] if root_sym else "", line=root_sym[3] if root_sym else 0)
+            root = GraphNode(
+                name=name, kind=root_sym[1] if root_sym else "?", path=root_sym[2] if root_sym else "", line=root_sym[3] if root_sym else 0
+            )
             self._expand(store, root, depth, defined, set(), forward=True)
             return root
 
@@ -137,21 +155,37 @@ class GraphEngine:
         """Reverse call tree: who is (transitively) affected if ``name`` changes."""
         with IndexStore(self.db_path) as store:
             root_sym = store.conn.execute(
-                "SELECT name, kind, path, start_line FROM symbols WHERE name=? LIMIT 1", (name,)
+                "SELECT name, kind, path, start_line FROM symbols WHERE name=? ORDER BY path, start_line LIMIT 1", (name,)
             ).fetchone()
-            root = GraphNode(name=name, kind=root_sym[1] if root_sym else "?", path=root_sym[2] if root_sym else "", line=root_sym[3] if root_sym else 0)
+            root = GraphNode(
+                name=name, kind=root_sym[1] if root_sym else "?", path=root_sym[2] if root_sym else "", line=root_sym[3] if root_sym else 0
+            )
             self._expand(store, root, depth, set(), set(), forward=False)
             return root
 
-    def _expand(self, store: IndexStore, node: GraphNode, depth: int, defined: set[str], visited: set[str], *, forward: bool) -> None:
-        if depth <= 0 or node.name in visited:
+    def _expand(
+        self,
+        store: IndexStore,
+        node: GraphNode,
+        depth: int,
+        defined: set[str],
+        visited: set[tuple[str, str, int]],
+        *,
+        forward: bool,
+    ) -> None:
+        node_key = (node.name, node.path, node.line)
+        if depth <= 0 or node_key in visited:
             return
-        visited.add(node.name)
-        neighbors = self._dependencies(store, node.name, defined) if forward else self._dependents(store, node.name)
+        branch_visited = visited | {node_key}
+        neighbors = (
+            self._dependencies(store, node.name, defined, path=node.path or None, start_line=node.line)
+            if forward
+            else self._dependents(store, node.name)
+        )
         for n in neighbors:
             child = GraphNode(name=n.name, kind=n.kind, path=n.path, line=n.start_line)
             node.children.append(child)
-            self._expand(store, child, depth - 1, defined, visited, forward=forward)
+            self._expand(store, child, depth - 1, defined, branch_visited, forward=forward)
 
     def file_summary(self, rel_path: str) -> FileSummary | None:
         with IndexStore(self.db_path) as store:
@@ -165,11 +199,7 @@ class GraphEngine:
                 )
             ]
             defined = self._defined_names(store)
-            refs = {
-                r[0]
-                for r in store.conn.execute("SELECT DISTINCT name FROM refs WHERE path=?", (rel_path,))
-                if r[0] in defined
-            }
+            refs = {r[0] for r in store.conn.execute("SELECT DISTINCT name FROM refs WHERE path=?", (rel_path,)) if r[0] in defined}
             own = {s.name for s in syms}
             depends_on = sorted(refs - own)
             return FileSummary(path=rel_path, language=frow[0], symbols=syms, depends_on=depends_on)

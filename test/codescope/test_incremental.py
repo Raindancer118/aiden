@@ -37,6 +37,20 @@ def test_reindex_paths_updates_and_prunes(tmp_path: Path) -> None:
     assert _symbol_names(db) == {"alpha", "alpha2", "gamma"}
 
 
+def test_reindex_paths_prunes_file_newly_added_to_gitignore(tmp_path: Path) -> None:
+    (tmp_path / "generated.py").write_text("def generated():\n    pass\n")
+    db = tmp_path / "idx" / "index.db"
+    idx = Indexer(tmp_path, db_path=db)
+    idx.reindex(embeddings=False)
+    assert _symbol_names(db) == {"generated"}
+
+    (tmp_path / ".gitignore").write_text("generated.py\n")
+    report = idx.reindex_paths(["generated.py"], embeddings=False)
+
+    assert report.removed == 1
+    assert _symbol_names(db) == set()
+
+
 def test_git_changes_detects_untracked(tmp_path: Path) -> None:
     pygit2 = pytest.importorskip("pygit2")
     pygit2.init_repository(str(tmp_path))
@@ -63,6 +77,86 @@ def test_sync_incremental_git_scoped(tmp_path: Path) -> None:
     report = sync_incremental(Indexer(tmp_path, db_path=db), embeddings=False)
     assert report.indexed == 1
     assert "serve" in _symbol_names(db)
+
+
+def test_sync_incremental_detects_clean_commits(tmp_path: Path) -> None:
+    pygit2 = pytest.importorskip("pygit2")
+    repo = pygit2.init_repository(str(tmp_path))
+    signature = pygit2.Signature("Test", "test@example.com")
+    source = tmp_path / "svc.py"
+    source.write_text("def first_version():\n    pass\n")
+
+    repo.index.add("svc.py")
+    repo.index.write()
+    first_tree = repo.index.write_tree()
+    repo.create_commit("HEAD", signature, signature, "initial", first_tree, [])
+
+    db = tmp_path / "idx" / "index.db"
+    indexer = Indexer(tmp_path, db_path=db)
+    first = sync_incremental(indexer, embeddings=False)
+    assert first.indexed == 1
+    assert _symbol_names(db) == {"first_version"}
+
+    source.write_text("def second_version():\n    pass\n")
+    repo.index.add("svc.py")
+    repo.index.write()
+    second_tree = repo.index.write_tree()
+    repo.create_commit("HEAD", signature, signature, "second", second_tree, [repo.head.target])
+
+    second = sync_incremental(indexer, embeddings=False)
+    assert second.indexed == 1
+    assert _symbol_names(db) == {"second_version"}
+
+
+def test_sync_incremental_detects_same_head_worktree_restore(tmp_path: Path) -> None:
+    pygit2 = pytest.importorskip("pygit2")
+    repo = pygit2.init_repository(str(tmp_path))
+    signature = pygit2.Signature("Test", "test@example.com")
+    source = tmp_path / "svc.py"
+    source.write_text("def committed_version():\n    pass\n")
+    repo.index.add("svc.py")
+    repo.index.write()
+    tree = repo.index.write_tree()
+    repo.create_commit("HEAD", signature, signature, "initial", tree, [])
+
+    db = tmp_path / "idx" / "index.db"
+    indexer = Indexer(tmp_path, db_path=db)
+    sync_incremental(indexer, embeddings=False)
+
+    source.write_text("def dirty_version():\n    pass\n")
+    sync_incremental(indexer, embeddings=False)
+    assert _symbol_names(db) == {"dirty_version"}
+
+    repo.checkout_head(strategy=pygit2.GIT_CHECKOUT_FORCE)
+    restored = sync_incremental(indexer, embeddings=False)
+
+    assert restored.indexed == 1
+    assert _symbol_names(db) == {"committed_version"}
+
+
+def test_sync_incremental_reconciles_dirty_gitignore_changes(tmp_path: Path) -> None:
+    pygit2 = pytest.importorskip("pygit2")
+    repo = pygit2.init_repository(str(tmp_path))
+    signature = pygit2.Signature("Test", "test@example.com")
+    (tmp_path / "keep.py").write_text("def keep():\n    pass\n")
+    (tmp_path / "generated.py").write_text("def generated():\n    pass\n")
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("")
+    repo.index.add_all()
+    repo.index.write()
+    tree = repo.index.write_tree()
+    repo.create_commit("HEAD", signature, signature, "initial", tree, [])
+
+    db = tmp_path / "idx" / "index.db"
+    indexer = Indexer(tmp_path, db_path=db)
+    sync_incremental(indexer, embeddings=False)
+    assert _symbol_names(db) == {"generated", "keep"}
+
+    gitignore.write_text("generated.py\n")
+    ignored = sync_incremental(indexer, embeddings=False)
+
+    assert ignored.removed == 1
+    assert _symbol_names(db) == {"keep"}
 
 
 def test_watcher_picks_up_changes(tmp_path: Path) -> None:

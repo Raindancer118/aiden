@@ -6,6 +6,9 @@ that the fork's core integration mechanism works without editing any Serena
 source file.
 """
 
+import subprocess
+import sys
+
 
 def test_codescope_importable() -> None:
     import codescope
@@ -22,11 +25,12 @@ def test_info_tool_name() -> None:
 
 
 def test_registration_appends_tool_package() -> None:
-    from codescope.cli import register_codescope_tools
+    from codescope.cli import LOCAL_MEMORY_TOOLS, register_codescope_tools
     from serena.tools import tools_base
 
     register_codescope_tools()
     assert "codescope.tools" in tools_base.tool_packages
+    assert tools_base.tool_names_excluded_from_registry >= LOCAL_MEMORY_TOOLS
 
 
 def test_info_tool_registered_in_registry() -> None:
@@ -38,9 +42,12 @@ def test_info_tool_registered_in_registry() -> None:
 
     registry = ToolRegistry()
     tool_names = registry.get_tool_names()
-    assert "codescope_info" in tool_names, (
-        f"codescope_info not registered; available tools: {sorted(tool_names)}"
-    )
+    assert "codescope_info" in tool_names, f"codescope_info not registered; available tools: {sorted(tool_names)}"
+    assert "memory_project_context" in tool_names
+    assert "memory_upsert" in tool_names
+    assert "read_memory" not in tool_names
+    assert "write_memory" not in tool_names
+    assert "onboarding" not in tool_names
 
 
 def test_info_tool_apply_runs() -> None:
@@ -52,3 +59,14 @@ def test_info_tool_apply_runs() -> None:
     result = CodescopeInfoTool.apply(object.__new__(CodescopeInfoTool))  # type: ignore[arg-type]
     assert "Volantic Codescope" in result
     assert __version__ in result
+
+
+def test_codescope_cli_does_not_expose_local_memory_commands() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "codescope.cli", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "memories" not in result.stdout

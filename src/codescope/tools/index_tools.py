@@ -20,17 +20,20 @@ class ReindexTool(Tool):
     project, and again after large external changes.
     """
 
-    def apply(self, force: bool = False) -> str:
+    def apply(self, force: bool = False, embeddings: bool = True) -> str:
         """
         Build or refresh the project index.
 
         :param force: if true, reindex every file even if its content hash is
             unchanged (use after upgrading Codescope or changing the embedder).
+        :param embeddings: build semantic vectors. Disable this for a fast
+            lexical-only first pass; a later normal reindex fills missing
+            vectors without reparsing unchanged files.
         :return: a JSON summary with counts of indexed/skipped/removed files,
             errors, total symbols, per-language file counts, and duration.
         """
         indexer = Indexer(self.get_project_root())
-        report = indexer.reindex(force=force)
+        report = indexer.reindex(force=force, embeddings=embeddings)
         return self._to_json(
             {
                 "indexed": report.indexed,

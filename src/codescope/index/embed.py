@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_FASTEMBED_MODEL = "jinaai/jina-embeddings-v2-base-code"
 DEFAULT_GEMINI_MODEL = "gemini-embedding-001"
-_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_TOKEN_RE = re.compile(r"[^\W\d]\w*|_\w*")
 
 
 def _l2_normalize(vec: list[float]) -> list[float]:
@@ -56,6 +56,8 @@ class HashingEmbedder(Embedder):
     """Deterministic, dependency-free hashing embedder (lexical fallback)."""
 
     def __init__(self, dim: int = 256):
+        if dim <= 0:
+            raise ValueError("Embedding dimension must be positive.")
         self.dim = dim
         self.id = f"hashing-{dim}"
 
@@ -94,6 +96,8 @@ class GeminiEmbedder(Embedder):
     """Cloud embeddings via Google Gemini (optional, requires API key)."""
 
     def __init__(self, model_name: str = DEFAULT_GEMINI_MODEL, dim: int = 768, api_key: str | None = None):
+        if dim <= 0:
+            raise ValueError("Embedding dimension must be positive.")
         from google import genai  # lazy: only when selected
 
         key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")

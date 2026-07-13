@@ -10,4 +10,5 @@ from codescope.tools.graph_tools import *
 from codescope.tools.incremental_tools import *
 from codescope.tools.index_tools import *
 from codescope.tools.info_tools import *
+from codescope.tools.memory_tools import *
 from codescope.tools.search_tools import *

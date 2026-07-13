@@ -527,6 +527,8 @@ class RegisteredTool:
 
 
 tool_packages = ["serena.tools"]
+tool_names_excluded_from_registry: set[str] = set()
+tool_exclusion_aliases: dict[str, set[str]] = {}
 
 
 @singleton
@@ -549,6 +551,8 @@ class ToolRegistry:
             is_optional = issubclass(cls, ToolMarkerOptional)
             is_beta = issubclass(cls, ToolMarkerBeta)
             name = cls.get_name_from_cls()
+            if name in tool_names_excluded_from_registry:
+                continue
             if name in self._tool_dict:
                 raise ValueError(f"Duplicate tool name found: {name}. Tool classes must have unique names.")
             self._tool_dict[name] = RegisteredTool(tool_class=cls, is_optional=is_optional, tool_name=name, is_beta=is_beta)
@@ -634,6 +638,9 @@ class ToolRegistry:
         """Returns True if the tool name is valid, False if it is deleted, and raises ValueError if it is invalid."""
         if self.is_deleted_tool_name(tool_name):
             log.warning(f"Tool name is deleted: {tool_name}{caller_context_for_logging}")
+            return False
+        if tool_name in tool_names_excluded_from_registry:
+            log.debug(f"Tool name is disabled by the active product: {tool_name}{caller_context_for_logging}")
             return False
         if not self.is_valid_tool_name(tool_name):
             raise ValueError(f"Invalid tool name: {tool_name}{caller_context_for_logging}")

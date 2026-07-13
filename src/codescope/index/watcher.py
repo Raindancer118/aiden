@@ -12,10 +12,14 @@ import logging
 import threading
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from codescope.index.indexer import _DEFAULT_IGNORE_DIRS as IGNORE_DIRS
 from codescope.index.indexer import Indexer
 from codescope.index.languages import spec_for_path
+
+if TYPE_CHECKING:
+    from watchfiles.filters import DefaultFilter
 
 log = logging.getLogger(__name__)
 
@@ -54,13 +58,13 @@ class IndexWatcher:
             self._thread.join(timeout=5)
         self._thread = None
 
-    def _build_filter(self):
+    def _build_filter(self) -> "DefaultFilter":
         from watchfiles.filters import DefaultFilter
 
         extra = tuple(d for d in IGNORE_DIRS if d not in DefaultFilter.ignore_dirs)
 
         class _Filter(DefaultFilter):
-            ignore_dirs = DefaultFilter.ignore_dirs + extra
+            ignore_dirs = (*DefaultFilter.ignore_dirs, *extra)
 
         return _Filter()
 
@@ -72,21 +76,30 @@ class IndexWatcher:
                 self.last_event_at = time.time()
                 self.batches += 1
                 rels: list[str] = []
+                refresh_all = False
                 for _change, raw_path in batch:
                     p = Path(raw_path)
                     try:
                         rel = p.resolve().relative_to(self.root).as_posix()
                     except ValueError:
                         continue
+                    if rel == ".gitignore":
+                        refresh_all = True
+                        continue
                     # Keep deletions (path may be gone) and supported source files.
                     if not p.exists() or spec_for_path(rel) is not None:
                         rels.append(rel)
-                if not rels:
+                if not rels and not refresh_all:
                     continue
                 try:
-                    report = self.indexer.reindex_paths(rels, force=False, embeddings=self.embeddings)
+                    if refresh_all:
+                        report = self.indexer.reindex(force=False, embeddings=self.embeddings)
+                    else:
+                        report = self.indexer.reindex_paths(rels, force=False, embeddings=self.embeddings)
                     self.files_reindexed += report.indexed + report.removed
+                    self.error = None
                 except Exception as e:  # pragma: no cover - defensive
+                    self.error = str(e)
                     log.warning("Watcher reindex failed: %s", e)
         except Exception as e:  # pragma: no cover
             self.error = str(e)

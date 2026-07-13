@@ -43,7 +43,6 @@ class MemoryManager:
         self._project_memory_dir: Path | None = None
         if serena_data_folder is not None:
             self._project_memory_dir = Path(serena_data_folder) / "memories"
-            self._project_memory_dir.mkdir(parents=True, exist_ok=True)
         self._encoding = SERENA_FILE_ENCODING
         self._read_only_memory_patterns = [re.compile(pattern) for pattern in set(read_only_memory_patterns)]
         self._ignored_memory_patterns = [re.compile(pattern) for pattern in set(ignored_memory_patterns)]
@@ -200,6 +199,7 @@ class MemoryManager:
         self._check_not_ignored(name)
         self._check_write_access(name, is_tool_context)
         memory_file_path = self.get_memory_file_path(name)
+        memory_file_path.parent.mkdir(parents=True, exist_ok=True)
         with open(memory_file_path, "w", encoding=self._encoding) as f:
             f.write(content)
         return f"Memory {name} written."

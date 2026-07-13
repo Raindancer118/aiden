@@ -16,9 +16,11 @@ It is built as a private fork of [Serena](https://github.com/oraios/serena)
 | **Code graphs** | dependencies, dependents, call chains, change-impact (blast radius), project map, file summaries | `get_dependencies`, `get_dependents`, `get_call_chain`, `get_change_impact`, `get_project_map`, `get_file_summary` |
 | **Live indexing** | git-scoped fast sync + a debounced background file watcher | `sync_index`, `watch_start`, `watch_stop`, `watch_status` |
 | **Dev-ops** | auto-detecting test runner, project scaffolding, GitHub (via `gh`), git commit/diff/changelog | `run_tests`, `detect_test_framework`, `create_project`, `git_status`, `git_diff`, `git_commit`, `generate_changelog`, `github_*` |
+| **Durable memory** | mandatory Diary MCP backend with project auto-registration; no local Markdown fallback | `memory_context`, `memory_project_context`, `memory_get`, `memory_tree`, `memory_search*`, `memory_upsert`, `memory_delete` |
 
 Plus the full Serena toolset (`find_symbol`, `find_referencing_symbols`,
-`rename_symbol`, `replace_symbol_body`, memory, shell, …).
+`rename_symbol`, `replace_symbol_body`, shell, …). Serena's local
+`read_memory`/`write_memory`/onboarding workflow is intentionally removed.
 
 ## Why it's strong
 
@@ -29,9 +31,12 @@ Plus the full Serena toolset (`find_symbol`, `find_referencing_symbols`,
 - **Local-first.** Semantic embeddings run locally (code-aware ONNX model via
   `fastembed`) — no API key, nothing leaves the machine. An optional Gemini
   backend is available for the highest retrieval quality.
-- **Mergeable fork.** Serena's `serena/` and `solidlsp/` packages are kept
-  unmodified; all Codescope value lives in `src/codescope/` and registers into
-  Serena's tool registry at runtime, so upstream Serena updates stay mergeable.
+- **One durable memory source.** Codescope maintains a persistent MCP session
+  to Diary and uses only Diary's public tools. It never reads or writes the
+  Diary database directly and never falls back to `.serena/memories`.
+- **Mergeable fork.** Almost all Codescope value lives in `src/codescope/`.
+  Two deliberately small Serena hooks support tool exclusion and the Diary
+  activation hint; they keep upstream merges reviewable.
 
 ## Install
 
@@ -40,7 +45,14 @@ uv sync                       # installs Codescope + Serena + the index stack
 uv run codescope start-mcp-server
 ```
 
-The first `reindex` downloads the local embedding model (~160 MB) once.
+Diary must be installed as the `diary-mcp-local` executable. Override its safe,
+argument-aware launch command with `CODESCOPE_DIARY_COMMAND`; adjust the
+per-call timeout with `CODESCOPE_DIARY_TIMEOUT_SECONDS`. If Diary is unavailable,
+memory tools fail explicitly—there is no local fallback.
+
+The first `reindex` downloads the local embedding model (~160 MB) once. For an
+immediate lexical index, call `reindex(embeddings=false)` first; a later normal
+reindex backfills every missing vector without reparsing unchanged files.
 
 ## Use with Claude Code
 
@@ -68,9 +80,10 @@ Then, in a session: activate a project, run `reindex`, and use `search_code`,
 
 ```
 codescope MCP (FastMCP, stdio)  —  Serena tool registry (extended at runtime)
-  |- A  LSP / semantics        (serena + solidlsp, unmodified)
+  |- A  LSP / semantics        (serena + solidlsp; two small integration hooks)
   |- B  Hybrid index           (src/codescope/index: parser, store, embed, search, graph, incremental, watcher)
-  '- C  Dev-ops                (src/codescope/devops: testrunner, scaffold, github, vcs)
+  |- C  Dev-ops                (src/codescope/devops: testrunner, scaffold, github, vcs)
+  '- D  Durable memory         (persistent MCP client -> Diary; no local storage)
 ```
 
 The per-project index lives at `.serena/codescope/index.db`.

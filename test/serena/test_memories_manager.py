@@ -5,6 +5,7 @@ and :meth:`_prepare_name`).
 """
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -22,6 +23,16 @@ from serena.project import MemoryManager
 def manager() -> MemoryManager:
     # serena_data_folder=None: the tested helpers do not access the filesystem
     return MemoryManager(serena_data_folder=None)
+
+
+def test_project_memory_directory_is_created_only_when_written(tmp_path: Path) -> None:
+    manager = MemoryManager(serena_data_folder=tmp_path)
+    memory_dir = tmp_path / "memories"
+    assert not memory_dir.exists()
+
+    manager.save_memory("core", "durable context", is_tool_context=False)
+
+    assert (memory_dir / "core.md").read_text(encoding="utf-8") == "durable context"
 
 
 class TestPrepareName:

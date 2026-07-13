@@ -141,7 +141,7 @@ class ToolSet:
         :param tool_inclusion_definitions: the definitions to apply
         :return: a new tool set with the definitions applied
         """
-        from serena.tools import ToolRegistry
+        from serena.tools import ToolRegistry, tools_base
 
         def get_updated_tool_name(tool_name: str) -> str:
             """Retrieves the updated tool name if the provided tool name is deprecated, logging a warning."""
@@ -169,12 +169,16 @@ class ToolSet:
                     if registry.check_valid_tool_name(included_tool, " (in included optional tools)") and included_tool not in tool_names:
                         tool_names.add(included_tool)
                         included_tools.append(included_tool)
-                for excluded_tool in definition.excluded_tools:
-                    excluded_tool = get_updated_tool_name(excluded_tool)
-                    registry.check_valid_tool_name(excluded_tool, " (in excluded tools)")
-                    if excluded_tool in tool_names:
-                        tool_names.remove(excluded_tool)
-                        excluded_tools.append(excluded_tool)
+                for configured_excluded_tool in definition.excluded_tools:
+                    configured_excluded_tool = get_updated_tool_name(configured_excluded_tool)
+                    expanded_exclusions = {configured_excluded_tool}
+                    expanded_exclusions.update(tools_base.tool_exclusion_aliases.get(configured_excluded_tool, ()))
+                    for excluded_tool in sorted(expanded_exclusions):
+                        if not registry.check_valid_tool_name(excluded_tool, " (in excluded tools)"):
+                            continue
+                        if excluded_tool in tool_names:
+                            tool_names.remove(excluded_tool)
+                            excluded_tools.append(excluded_tool)
                 if included_tools:
                     log.info(f"{definition} included {len(included_tools)} tools: {', '.join(included_tools)}")
                 if excluded_tools:
@@ -1044,6 +1048,8 @@ class SerenaAgent:
                 )
             elif self._active_tools.contains_tool_class(OnboardingTool):
                 msg += "Onboarding has not been performed yet, you should call Serena's `onboarding` tool now to set up project memories."
+        elif self._active_tools.contains_tool_name("memory_project_context"):
+            msg += "\nDiary is the only memory backend. Call `memory_project_context` now to load this project's durable context."
 
         # add prompts for modes that were dynamically activated by the project
         modes_with_prompts = self._project_prompt_status.get_modes_with_prompts_to_be_provided_for_project_activation(session_id)

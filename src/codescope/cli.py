@@ -1,17 +1,50 @@
 """Command-line entrypoint for Volantic Codescope.
 
-This is a thin wrapper around Serena's CLI. Its job is to make sure the
-Codescope tool package is registered with Serena's :class:`ToolRegistry`
-*before* the registry singleton is first instantiated, and then to delegate to
-Serena's existing command group (so ``codescope start-mcp-server`` and every
-other Serena subcommand work unchanged).
-
-We deliberately register Codescope at runtime rather than editing any file
-under ``serena/`` or ``solidlsp/`` - this keeps the fork mergeable with
-upstream Serena.
+This wrapper registers Codescope's tools before Serena's registry singleton is
+created. It also removes Serena's local Markdown memory workflow: Codescope
+uses Diary through MCP as its only memory backend.
 """
 
 from __future__ import annotations
+
+LOCAL_MEMORY_TOOLS = frozenset(
+    {
+        "delete_memory",
+        "edit_memory",
+        "list_memories",
+        "onboarding",
+        "read_memory",
+        "rename_memory",
+        "write_memory",
+    }
+)
+
+DIARY_MEMORY_TOOLS = frozenset(
+    {
+        "memory_context",
+        "memory_delete",
+        "memory_get",
+        "memory_project_context",
+        "memory_search",
+        "memory_search_semantic",
+        "memory_tree",
+        "memory_upsert",
+    }
+)
+
+LEGACY_MEMORY_TOOL_EXCLUSION_ALIASES = {
+    "delete_memory": {"memory_delete"},
+    "edit_memory": {"memory_upsert"},
+    "list_memories": {"memory_tree"},
+    "read_memory": {
+        "memory_context",
+        "memory_get",
+        "memory_project_context",
+        "memory_search",
+        "memory_search_semantic",
+    },
+    "write_memory": {"memory_upsert"},
+}
 
 
 def register_codescope_tools() -> None:
@@ -25,6 +58,9 @@ def register_codescope_tools() -> None:
     """
     from serena.tools import tools_base
 
+    tools_base.tool_names_excluded_from_registry.update(LOCAL_MEMORY_TOOLS)
+    for legacy_name, diary_names in LEGACY_MEMORY_TOOL_EXCLUSION_ALIASES.items():
+        tools_base.tool_exclusion_aliases.setdefault(legacy_name, set()).update(diary_names)
     if "codescope.tools" not in tools_base.tool_packages:
         tools_base.tool_packages.append("codescope.tools")
 
@@ -39,6 +75,8 @@ def main() -> None:
 
     from serena.cli import top_level
 
+    # Codescope has no file-backed memory CLI. Diary is the sole backend.
+    top_level.commands.pop("memories", None)
     top_level()
 
 

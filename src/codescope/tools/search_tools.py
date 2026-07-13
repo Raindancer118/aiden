@@ -122,9 +122,7 @@ class FindDuplicateCodeTool(Tool, ToolMarkerSymbolicRead):
         :return: JSON list of clone groups, each with its members (name, kind,
             path, line range, line count) and the mean pairwise similarity.
         """
-        groups = SearchEngine(self.get_project_root()).find_duplicate_code(
-            min_lines=min_lines, similarity=similarity, limit=limit
-        )
+        groups = SearchEngine(self.get_project_root()).find_duplicate_code(min_lines=min_lines, similarity=similarity, limit=limit)
         return self._to_json([asdict(g) for g in groups])
 
 
@@ -139,9 +137,7 @@ class DetectClonesInDiffTool(Tool, ToolMarkerSymbolicRead):
     (git add -N) to show up. Requires an embeddings index (see reindex).
     """
 
-    def apply(
-        self, staged: bool = False, min_lines: int = 5, similarity: float = 0.85, limit: int = 50
-    ) -> str:
+    def apply(self, staged: bool = False, min_lines: int = 5, similarity: float = 0.85, limit: int = 50) -> str:
         """
         Report added diff blocks that duplicate existing code.
 

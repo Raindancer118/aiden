@@ -11,38 +11,67 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Literal, cast, overload
 
 
 class GhError(RuntimeError):
     pass
 
 
-def _gh(args: list[str], *, cwd: str | Path | None = None, parse_json: bool = False, timeout: int = 120):
-    if shutil.which("gh") is None:
+@overload
+def _gh(args: list[str], *, cwd: str | Path | None = None, parse_json: Literal[False] = False, timeout: int = 120) -> str: ...
+
+
+@overload
+def _gh(args: list[str], *, cwd: str | Path | None = None, parse_json: Literal[True], timeout: int = 120) -> list[dict[str, object]]: ...
+
+
+def _gh(args: list[str], *, cwd: str | Path | None = None, parse_json: bool = False, timeout: int = 120) -> str | list[dict[str, object]]:
+    executable = shutil.which("gh")
+    if executable is None:
         raise GhError("GitHub CLI 'gh' is not installed.")
-    proc = subprocess.run(
-        ["gh", *args],
-        check=False, cwd=str(cwd) if cwd else None,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
+    try:
+        proc = subprocess.run(
+            [executable, *args],
+            check=False,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise GhError(f"GitHub CLI command timed out after {timeout}s.") from error
+    except OSError as error:
+        raise GhError(f"Could not start GitHub CLI: {error}") from error
     if proc.returncode != 0:
         raise GhError((proc.stderr or proc.stdout or "gh command failed").strip())
     out = proc.stdout.strip()
     if parse_json:
-        return json.loads(out) if out else []
+        try:
+            data = json.loads(out) if out else []
+        except json.JSONDecodeError as error:
+            raise GhError("GitHub CLI returned invalid JSON.") from error
+        if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+            raise GhError("GitHub CLI returned an unexpected JSON response.")
+        return cast(list[dict[str, object]], data)
     return out
 
 
 def repo_create(name: str, *, private: bool = True, description: str = "", source: str | Path | None = None, push: bool = False) -> str:
-    args = ["repo", "create", name, "--private" if private else "--public"]
+    if not name or "\0" in name:
+        raise GhError("Repository name must be non-empty and must not contain NUL characters.")
+    args = ["repo", "create", "--private" if private else "--public"]
     if description:
         args += ["--description", description]
     if source:
         args += ["--source", str(source)]
         if push:
             args += ["--push"]
+    # End option parsing before the user-controlled positional value. A name
+    # such as `--help` or `--source=...` must never alter the gh operation.
+    args += ["--", name]
     return _gh(args)
 
 
@@ -87,8 +116,11 @@ def run_list(cwd: str | Path, *, limit: int = 15) -> list[dict]:
 
 
 def release_create(cwd: str | Path, *, tag: str, title: str = "", notes: str = "") -> str:
-    args = ["release", "create", tag]
+    if not tag or "\0" in tag:
+        raise GhError("Release tag must be non-empty and must not contain NUL characters.")
+    args = ["release", "create"]
     if title:
         args += ["--title", title]
     args += ["--notes", notes]
+    args += ["--", tag]
     return _gh(args, cwd=cwd)
