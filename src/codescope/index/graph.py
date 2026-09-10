@@ -130,6 +130,14 @@ class GraphEngine:
 
     # -- public API -------------------------------------------------------
 
+    def dependents_in(self, store: IndexStore, name: str) -> list[SymbolRef]:
+        """Callers of ``name``, reusing an open store (batched callers)."""
+        return self._dependents(store, name)
+
+    def dependencies_in(self, store: IndexStore, name: str, *, path: str | None = None, start_line: int | None = None) -> list[SymbolRef]:
+        """Callees of one specific definition of ``name``, reusing an open store."""
+        return self._dependencies(store, name, self._defined_names(store), path=path, start_line=start_line)
+
     def dependents(self, name: str) -> list[SymbolRef]:
         with IndexStore(self.db_path) as store:
             return self._dependents(store, name)

@@ -12,7 +12,7 @@ import pytest
 
 from codescope.index.embed import HashingEmbedder, embedder_from_id
 from codescope.index.indexer import Indexer
-from codescope.index.search import SearchEngine
+from codescope.index.search import SearchEngine, SearchFilter
 
 
 @pytest.fixture
@@ -47,7 +47,11 @@ def test_hybrid_search_finds_symbol_and_fuses_sources(indexed: tuple[Path, Path]
     # At least one hit should be supported by more than one retriever.
     assert any(len(h.sources) >= 1 for h in hits)
     top = hits[0]
-    assert {"bm25", "vector", "trigram"} >= set(top.sources)
+    assert {"name", "bm25", "vector", "trigram"} >= set(top.sources)
+    # A hit must be actionable on its own: it carries its code and identity.
+    assert top.symbol_id > 0
+    assert top.preview.strip()
+    assert top.lang == "python"
 
 
 def test_semantic_search_returns_results(indexed: tuple[Path, Path]) -> None:
@@ -334,3 +338,93 @@ def test_embedder_from_id_is_cached() -> None:
     assert first is second
     assert get_embedder("hashing", dim=64) is get_embedder("hashing", dim=64)
     assert embedder_from_id("hashing-128") is not first
+
+
+# -- filters, previews and fusion hygiene ------------------------------------
+
+
+@pytest.fixture
+def indexed_multi(tmp_path: Path) -> tuple[Path, Path]:
+    """A tree with two languages, a test file and a nested package."""
+    src = tmp_path / "src" / "auth"
+    src.mkdir(parents=True)
+    (src / "tokens.py").write_text(
+        "class TokenStore:\n    pass\n\n\ndef validate_token(token):\n    '''Validate an auth token.'''\n    return bool(token)\n"
+    )
+    (tmp_path / "src" / "auth" / "tokens.go").write_text('package auth\n\nfunc ValidateToken(t string) bool {\n\treturn t != ""\n}\n')
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_tokens.py").write_text("def test_validate_token():\n    assert validate_token('x')\n")
+    db = tmp_path / "idx" / "index.db"
+    assert Indexer(tmp_path, db_path=db).reindex(embedder=HashingEmbedder()).errors == 0
+    return tmp_path, db
+
+
+def test_language_filter_narrows_before_top_k(indexed_multi: tuple[Path, Path]) -> None:
+    root, db = indexed_multi
+    hits = SearchEngine(root, db_path=db).hybrid_search("validate token", limit=10, flt=SearchFilter(lang="go"))
+    assert hits
+    assert {h.lang for h in hits} == {"go"}
+
+
+def test_kind_and_test_exclusion_filters(indexed_multi: tuple[Path, Path]) -> None:
+    root, db = indexed_multi
+    engine = SearchEngine(root, db_path=db)
+
+    classes = engine.hybrid_search("token", limit=10, flt=SearchFilter(kind="class"))
+    assert classes and {h.kind for h in classes} == {"class"}
+
+    assert any(h.path.startswith("tests/") for h in engine.hybrid_search("validate token", limit=10))
+    without_tests = engine.hybrid_search("validate token", limit=10, flt=SearchFilter(exclude_tests=True))
+    assert without_tests
+    assert not any(h.path.startswith("tests/") for h in without_tests)
+
+
+def test_path_glob_filter(indexed_multi: tuple[Path, Path]) -> None:
+    root, db = indexed_multi
+    hits = SearchEngine(root, db_path=db).hybrid_search("token", limit=10, flt=SearchFilter(path_glob="src/auth/*.py"))
+    assert hits
+    assert all(h.path.startswith("src/auth/") and h.path.endswith(".py") for h in hits)
+
+
+def test_filter_that_matches_nothing_returns_nothing(indexed_multi: tuple[Path, Path]) -> None:
+    root, db = indexed_multi
+    assert SearchEngine(root, db_path=db).hybrid_search("token", limit=10, flt=SearchFilter(lang="rust")) == []
+
+
+def test_natural_language_query_does_not_use_the_trigram_retriever(indexed_multi: tuple[Path, Path]) -> None:
+    """A sentence cannot appear verbatim in code; ranking on it is noise."""
+    root, db = indexed_multi
+    hits = SearchEngine(root, db_path=db).hybrid_search("how do we validate an auth token", limit=10)
+    assert hits
+    assert not any("trigram" in h.sources for h in hits)
+
+    identifier_hits = SearchEngine(root, db_path=db).hybrid_search("validate_token", limit=10)
+    assert any("trigram" in h.sources for h in identifier_hits)
+
+
+def test_preview_folds_long_bodies_instead_of_dumping_them(tmp_path: Path) -> None:
+    lines = "\n".join(f"    step_{i}()" for i in range(200))
+    (tmp_path / "long.py").write_text(f"def long_function():\n{lines}\n    return 1\n")
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embedder=HashingEmbedder())
+
+    hit = SearchEngine(tmp_path, db_path=db).hybrid_search("long_function", limit=1)[0]
+    assert hit.preview.count("\n") < 20
+    assert "lines omitted" in hit.preview
+    assert hit.preview.startswith("def long_function():")
+    # The tail of the body must still be searchable even though it is folded.
+    assert SearchEngine(tmp_path, db_path=db).substring_search("step_199", limit=5)
+
+
+def test_clone_group_reports_its_weakest_pair(tmp_path: Path) -> None:
+    """Similarity is not transitive: a chained cluster must not look like a clique."""
+    body = "def {name}(items):\n    total = 0\n    for item in items:\n        total = total + item\n    return total\n"
+    (tmp_path / "a.py").write_text(body.format(name="sum_items"))
+    (tmp_path / "b.py").write_text(body.format(name="sum_items"))
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embedder=HashingEmbedder())
+
+    group = SearchEngine(tmp_path, db_path=db).find_duplicate_code(min_lines=3, similarity=0.95)[0]
+    assert group.min_similarity <= group.similarity
+    assert group.min_similarity >= 0.95  # a true clone pair: every pair holds up

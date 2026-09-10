@@ -9,7 +9,7 @@ from pathlib import Path
 
 from codescope.devops import github as gh
 from codescope.devops import scaffold, testrunner, vcs
-from serena.tools import Tool, ToolMarkerDoesNotRequireActiveProject
+from serena.tools import Tool, ToolMarkerCanEdit, ToolMarkerDoesNotRequireActiveProject
 
 # --------------------------------------------------------------------------- #
 # Test runner
@@ -52,7 +52,7 @@ class DetectTestFrameworkTool(Tool):
 # --------------------------------------------------------------------------- #
 
 
-class CreateProjectTool(Tool, ToolMarkerDoesNotRequireActiveProject):
+class CreateProjectTool(Tool, ToolMarkerCanEdit, ToolMarkerDoesNotRequireActiveProject):
     """
     Scaffold a new project from a template.
 
@@ -100,7 +100,7 @@ class GitDiffTool(Tool):
         return vcs.diff(self.get_project_root(), staged=staged)
 
 
-class GitCommitTool(Tool):
+class GitCommitTool(Tool, ToolMarkerCanEdit):
     """
     Create a git commit in the active project.
 
@@ -143,7 +143,7 @@ class GenerateChangelogTool(Tool):
 # --------------------------------------------------------------------------- #
 
 
-class GithubRepoCreateTool(Tool, ToolMarkerDoesNotRequireActiveProject):
+class GithubRepoCreateTool(Tool, ToolMarkerCanEdit, ToolMarkerDoesNotRequireActiveProject):
     """Create a GitHub repository via the gh CLI (private by default)."""
 
     def apply(self, name: str, private: bool = True, description: str = "") -> str:
@@ -175,7 +175,7 @@ class GithubPrListTool(Tool):
             return self._to_json({"error": str(e)})
 
 
-class GithubPrCreateTool(Tool):
+class GithubPrCreateTool(Tool, ToolMarkerCanEdit):
     """Create a pull request for the active project's repository."""
 
     def apply(self, title: str, body: str = "", base: str = "", draft: bool = False) -> str:
@@ -208,7 +208,7 @@ class GithubIssueListTool(Tool):
             return self._to_json({"error": str(e)})
 
 
-class GithubIssueCreateTool(Tool):
+class GithubIssueCreateTool(Tool, ToolMarkerCanEdit):
     """Create an issue in the active project's GitHub repository."""
 
     def apply(self, title: str, body: str = "", labels: str = "") -> str:
@@ -240,7 +240,7 @@ class GithubActionsStatusTool(Tool):
             return self._to_json({"error": str(e)})
 
 
-class GithubReleaseCreateTool(Tool):
+class GithubReleaseCreateTool(Tool, ToolMarkerCanEdit):
     """Create a GitHub release for the active project's repository."""
 
     def apply(self, tag: str, title: str = "", notes: str = "") -> str:

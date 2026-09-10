@@ -73,10 +73,14 @@ def main() -> None:
     """Entrypoint for the ``codescope`` console script."""
     register_codescope_tools()
 
+    from codescope.index_cli import index_group
     from serena.cli import top_level
 
     # Codescope has no file-backed memory CLI. Diary is the sole backend.
     top_level.commands.pop("memories", None)
+    # Indexing is the one operation worth running outside the MCP server, under
+    # a resource budget (see codescope.index_cli).
+    top_level.add_command(index_group)
     top_level()
 
 
