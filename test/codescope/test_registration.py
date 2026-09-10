@@ -99,3 +99,67 @@ def test_index_tool_bodies_execute(tmp_path) -> None:
     assert health["indexed"] is True
     assert health["symbols"] >= 1
     assert "advice" in health
+
+
+def test_hooked_tools_still_expose_their_mcp_schema() -> None:
+    """The explorer hooks wrap apply(); the MCP schema is built from it.
+
+    Serena derives every tool's description and parameter schema from the
+    apply method's docstring and signature. A wrapper that does not carry
+    those through does not degrade the schema -- it aborts server startup,
+    which is how this was found: the MCP server refused to boot at all.
+    """
+    from codescope.cli import _hook_explorer_notices, _hook_project_activation, register_codescope_tools
+
+    register_codescope_tools()
+    _hook_project_activation()
+    _hook_explorer_notices()
+
+    from serena.tools import ToolRegistry
+
+    registry = ToolRegistry()
+    checked = 0
+    for name in registry.get_tool_names():
+        tool_cls = registry.get_tool_class_by_name(name)
+        if not tool_cls.__module__.startswith(("codescope.tools", "serena.tools.config_tools")):
+            continue
+        assert tool_cls.get_apply_docstring_from_cls().strip(), f"{name} lost its docstring"
+        parameters = tool_cls.get_apply_fn_metadata_from_cls().arg_model.model_json_schema()
+        assert "properties" in parameters, f"{name} lost its parameter schema"
+        checked += 1
+    assert checked > 20, f"expected the codescope tools to be covered, checked only {checked}"
+
+
+def test_mcp_server_boots_with_every_tool() -> None:
+    """A start-up test: build the tool set the way the server does.
+
+    This is the exact step that failed when the hooks stripped apply()'s
+    metadata, so it is worth paying for on every run.
+    """
+    from codescope.cli import _hook_explorer_notices, _hook_project_activation, register_codescope_tools
+
+    register_codescope_tools()
+    _hook_project_activation()
+    _hook_explorer_notices()
+
+    from serena.mcp import SerenaMCPFactory
+    from serena.tools import ToolRegistry
+
+    class _Context:
+        tool_description_overrides: dict[str, str] = {}
+
+    class _Agent:
+        @staticmethod
+        def get_context() -> "_Context":
+            return _Context()
+
+    registry = ToolRegistry()
+    built = 0
+    for name in registry.get_tool_names():
+        tool_cls = registry.get_tool_class_by_name(name)
+        instance = object.__new__(tool_cls)
+        instance.agent = _Agent()  # type: ignore[attr-defined]
+        mcp_tool = SerenaMCPFactory.make_mcp_tool(instance, openai_tool_compatible=False)
+        assert mcp_tool.description, f"{name} would be exposed without a description"
+        built += 1
+    assert built > 80, f"expected the full tool set, built only {built}"

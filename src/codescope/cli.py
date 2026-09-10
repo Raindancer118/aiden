@@ -7,6 +7,7 @@ uses Diary through MCP as its only memory backend.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 
@@ -108,6 +109,10 @@ def _hook_project_activation() -> None:
         return
     original = ActivateProjectTool.apply
 
+    # functools.wraps is load-bearing, not cosmetic: Serena builds each MCP
+    # tool's description and parameter schema from apply()'s docstring and
+    # signature, and refuses to start when either is missing.
+    @functools.wraps(original)
     def apply(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         result = original(self, *args, **kwargs)
         try:
@@ -137,8 +142,11 @@ def _hook_explorer_notices() -> None:
             return
         original = tool_cls.apply
 
-        def apply(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-            result = original(self, *args, **kwargs)
+        # See the note in _hook_project_activation: the wrapper must carry
+        # the docstring and signature through or the server will not boot.
+        @functools.wraps(original)
+        def apply(self, *args, __original=original, **kwargs):  # type: ignore[no-untyped-def]
+            result = __original(self, *args, **kwargs)
             return append_notice(result) if isinstance(result, str) else result
 
         tool_cls.apply = apply  # type: ignore[method-assign]
