@@ -163,3 +163,15 @@ def test_mcp_server_boots_with_every_tool() -> None:
         assert mcp_tool.description, f"{name} would be exposed without a description"
         built += 1
     assert built > 80, f"expected the full tool set, built only {built}"
+
+
+def test_reported_version_matches_the_project() -> None:
+    """A hardcoded second copy drifted from pyproject for three releases."""
+    import tomllib
+    from pathlib import Path
+
+    import codescope
+
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    assert codescope.__version__ == declared

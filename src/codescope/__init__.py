@@ -12,6 +12,21 @@ lives in this ``codescope`` package and is registered into Serena's existing
 tool registry.
 """
 
-__version__ = "0.1.0"
+
+def _installed_version() -> str:
+    """Read the version from package metadata rather than repeating it here.
+
+    A second copy drifts: this said 0.1.0 while the project was on 0.3.x, so
+    ``codescope_info`` reported a version that had not existed for a while.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("volantic-codescope")
+    except PackageNotFoundError:  # pragma: no cover - running from a source tree
+        return "0+unknown"
+
+
+__version__ = _installed_version()
 
 PRODUCT_NAME = "Volantic Codescope"
