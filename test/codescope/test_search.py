@@ -428,3 +428,73 @@ def test_clone_group_reports_its_weakest_pair(tmp_path: Path) -> None:
     group = SearchEngine(tmp_path, db_path=db).find_duplicate_code(min_lines=3, similarity=0.95)[0]
     assert group.min_similarity <= group.similarity
     assert group.min_similarity >= 0.95  # a true clone pair: every pair holds up
+
+
+def test_batching_budgets_padded_cost_not_item_count() -> None:
+    """A batch costs count x longest item, so that product is what is capped."""
+    embedder = _RecordingEmbedder()
+    embedder.batch_size = 64
+    embedder.batch_chars = 1000
+
+    short = ["x" * 10] * 60
+    long = ["y" * 900] * 3
+    list(embedder.embed_batched(short + long))
+
+    for call in embedder.calls:
+        cost = len(call) * max(len(t) for t in call)
+        assert cost <= embedder.batch_chars * 2, (len(call), max(len(t) for t in call))
+    # Short symbols must NOT be throttled down to the long items' batch size.
+    assert max(len(call) for call in embedder.calls) > 10
+    # ... while the long ones go out in tiny batches.
+    long_batches = [c for c in embedder.calls if max(len(t) for t in c) > 500]
+    assert long_batches and all(len(c) <= 2 for c in long_batches)
+
+
+def test_every_text_is_embedded_exactly_once_under_budgeting() -> None:
+    embedder = _RecordingEmbedder()
+    embedder.batch_size = 8
+    embedder.batch_chars = 500
+    texts = [f"sym{i}" + "z" * (i * 31 % 400) for i in range(97)]
+
+    seen: dict[int, list[float]] = {}
+    for batch in embedder.embed_batched(texts):
+        for index, vector in batch:
+            assert index not in seen
+            seen[index] = vector
+    assert sorted(seen) == list(range(len(texts)))
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tests/test_thing.py",
+        "src/pkg/test_thing.py",
+        "src/pkg/thing_test.go",
+        "src/pkg/thing.test.ts",
+        "src/pkg/thing.spec.ts",
+        "src/java/ThingTest.java",
+        "spec/thing_spec.rb",
+    ],
+)
+def test_exclude_tests_recognises_the_usual_conventions(tmp_path: Path, path: str) -> None:
+    target = tmp_path / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    suffix = target.suffix
+    sources = {
+        ".py": "def helper_thing():\n    return 1\n",
+        ".go": "package pkg\n\nfunc HelperThing() int {\n\treturn 1\n}\n",
+        ".ts": "export function helperThing(): number { return 1; }\n",
+        ".java": "class ThingTest { void helperThing() {} }\n",
+        ".rb": "def helper_thing\n  1\nend\n",
+    }
+    target.write_text(sources[suffix])
+    (tmp_path / "prod.py").write_text("def helper_thing():\n    return 2\n")
+
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embedder=HashingEmbedder())
+    engine = SearchEngine(tmp_path, db_path=db)
+
+    assert any(h.path == path for h in engine.hybrid_search("helper thing", limit=20)), "fixture must be indexed"
+    filtered = engine.hybrid_search("helper thing", limit=20, flt=SearchFilter(exclude_tests=True))
+    assert not any(h.path == path for h in filtered), f"{path} should be recognised as a test file"
+    assert any(h.path == "prod.py" for h in filtered)

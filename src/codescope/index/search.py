@@ -59,7 +59,29 @@ _DIFF_CANDIDATES = 5
 #: Lines of code returned with each hit (head + tail around a fold marker).
 _DEFAULT_PREVIEW_LINES = 12
 
-_TEST_PATH_PATTERNS = ("test/*", "tests/*", "*/test/*", "*/tests/*", "*/spec/*", "test_*", "*_test.*", "*.test.*", "*.spec.*", "*Test.*")
+_TEST_PATH_PATTERNS = (
+    # Directory conventions, at the root and at any depth.
+    "test/*",
+    "tests/*",
+    "spec/*",
+    "*/test/*",
+    "*/tests/*",
+    "*/spec/*",
+    "*/testing/*",
+    # File-name conventions, at the root and in any directory.
+    "test_*",
+    "*/test_*",
+    "*_test.*",
+    "*/*_test.*",
+    "*.test.*",
+    "*/*.test.*",
+    "*.spec.*",
+    "*/*.spec.*",
+    "*Test.*",
+    "*/*Test.*",
+    "*Tests.*",
+    "*/*Tests.*",
+)
 
 
 @dataclass(slots=True)
@@ -123,7 +145,7 @@ def _filter_sql(flt: "SearchFilter | None") -> tuple[str, list[object]]:
         clauses.append("s.path LIKE ? ESCAPE '\\'")
         params.append(_glob_to_like(flt.path_glob))
     if flt.exclude_tests:
-        clauses.extend(["s.path NOT LIKE ?"] * len(_TEST_PATH_PATTERNS))
+        clauses.extend(["s.path NOT LIKE ? ESCAPE '\\'"] * len(_TEST_PATH_PATTERNS))
         params.extend(_glob_to_like(p) for p in _TEST_PATH_PATTERNS)
     return (" AND " + " AND ".join(clauses)) if clauses else "", params
 
