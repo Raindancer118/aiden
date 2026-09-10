@@ -19,6 +19,7 @@ It is built as a private fork of [Serena](https://github.com/oraios/serena)
 | **Reuse & clones** | "does this already exist?" before writing; semantic clone clusters; a pre-commit duplication gate | `find_similar_code`, `find_duplicate_code`, `detect_clones_in_diff` |
 | **Live indexing** | git-scoped fast sync + a debounced background file watcher | `sync_index`, `watch_start`, `watch_stop`, `watch_status` |
 | **Dev-ops** | auto-detecting test runner, project scaffolding, GitHub (via `gh`), git commit/diff/changelog | `run_tests`, `detect_test_framework`, `create_project`, `git_status`, `git_diff`, `git_commit`, `generate_changelog`, `github_*` |
+| **Explorer (web UI)** | one shared local page for every project Codescope runs in: hybrid search, call graph, whole-project dependency graph, file tree, clone clusters, index health, and index actions | `codescope index explorer`, auto-started with the MCP server |
 | **Durable memory** | mandatory Diary MCP backend with project auto-registration; no local Markdown fallback | `memory_context`, `memory_project_context`, `memory_get`, `memory_tree`, `memory_search*`, `memory_upsert`, `memory_delete` |
 
 Plus the full Serena toolset (`find_symbol`, `find_referencing_symbols`,
@@ -81,6 +82,32 @@ Tuning (all optional):
 | `CODESCOPE_EMBED_BATCH_COST` | memory budget per forward pass, as `item count x longest item^2` in char² (default 20000000). This is the dial for peak memory: ONNX pads every item to the longest one in the batch, and attention is quadratic in that length. Batches run longest-first, so this budget sets the high-water mark on the very first batch and the rest of the run reuses it. Raise it for throughput, lower it for a smaller footprint. |
 | `CODESCOPE_EMBED_BATCH` | hard cap on documents per forward pass (default 128); the character budget above usually binds first. |
 | `CODESCOPE_EMBED_THREADS` | ONNX thread count. Unset means "all cores". |
+
+## The explorer
+
+Activating a project starts a local web UI on <http://127.0.0.1:24256> and
+opens it once. A second Codescope instance does not start a second server: it
+registers its project with the one already running, and the open page picks it
+up. `CODESCOPE_EXPLORER=0` turns the whole thing off; `codescope index explorer`
+starts it by hand.
+
+What it shows, per project:
+
+- **Search** — the same hybrid search the agent uses, with the test filter.
+- **Call graph** — callers and callees around a symbol, click any node to walk;
+  or the **whole project** as a dependency ring aggregated by directory.
+- **Files** — every indexed file, and the symbols inside one.
+- **Clones** — near-duplicate clusters with their weakest pair.
+- **Health** — what the index can and cannot answer, and what to do about it.
+
+It can also run index maintenance (sync, reindex, watch start/stop). Those are
+the only write operations exposed; editing, deletion and shell access stay out
+of the browser on purpose. When you run one, the agent is told with its next
+tool result — explicitly as a notification it does not have to act on.
+
+The counter in the header opens the list of every project Codescope has run
+in, running or not, and can attach one that is not. The power button stops
+every attached instance and the server.
 
 ## Use with Claude Code
 

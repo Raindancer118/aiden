@@ -162,6 +162,27 @@ def doctor(project: Path, as_json: bool) -> None:
     sys.exit(1 if blocking else 0)
 
 
+@index_group.command("explorer")
+@_project_option
+@click.option("--no-browser", is_flag=True, help="Do not open a browser window.")
+@click.option("--port", default=None, type=int, help="Override the shared explorer port.")
+def explorer(project: Path, no_browser: bool, port: int | None) -> None:
+    """Open the graph explorer, attaching to an already running one."""
+    from codescope.web.explorer import EXPLORER_PORT, ensure_explorer
+
+    url, started = ensure_explorer(project, open_browser=not no_browser, port=port or EXPLORER_PORT)
+    click.echo(f"{'Started' if started else 'Attached to'} the Codescope explorer at {url}")
+    if not started:
+        click.echo("This project now appears in the page that is already open.")
+        return
+    click.echo("Ctrl-C to stop.")
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        click.echo("")
+
+
 @index_group.command("search")
 @_project_option
 @click.argument("query")

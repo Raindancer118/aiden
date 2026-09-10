@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codescope Explorer</title>
+<link rel="stylesheet" href="app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='11' fill='none' stroke='%235b8dd9' stroke-width='3'/><circle cx='16' cy='16' r='3' fill='%235b8dd9'/></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+      <circle cx="16" cy="16" r="11" fill="none" stroke="currentColor" stroke-width="2.5"/>
+      <circle cx="16" cy="16" r="3.2" fill="currentColor"/>
+      <path d="M16 5v4M16 23v4M5 16h4M23 16h4" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+    </svg>
+    <span>Codescope</span>
+  </div>
+
+  <label class="project-picker">
+    <span class="sr-only">Project</span>
+    <select id="project-select"></select>
+  </label>
+
+  <div class="search">
+    <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="6" fill="none" stroke="currentColor" stroke-width="2"/><path d="M13.5 13.5 18 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    <input id="search-input" type="search" placeholder="Search this codebase by meaning or name…" autocomplete="off" spellcheck="false">
+    <kbd>/</kbd>
+  </div>
+
+  <label class="toggle" title="Skip symbols defined in test files">
+    <input type="checkbox" id="exclude-tests"><span>Hide tests</span>
+  </label>
+
+  <div class="actions" role="group" aria-label="Index actions">
+    <button class="ghost-button" data-action="sync" type="button" title="Reindex only what git reports as changed">Sync</button>
+    <button class="ghost-button" data-action="reindex" type="button" title="Rebuild the index (incremental; unchanged files are skipped)">Reindex</button>
+    <button class="ghost-button" data-action="watch_start" type="button" title="Keep the index fresh in the background">Watch</button>
+    <button class="ghost-button" data-action="watch_stop" type="button" title="Stop the background watcher">Stop</button>
+  </div>
+
+  <button class="project-count" id="project-count" type="button" title="Projects Codescope knows about">
+    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 5.5A1.5 1.5 0 0 1 4 4h3.4l1.4 1.8H16a1.5 1.5 0 0 1 1.5 1.5v7.2A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+    <b id="project-count-value">–</b>
+    <span class="project-count-label">open</span>
+  </button>
+
+  <button class="icon-button" id="theme-toggle" type="button" title="Switch theme" aria-label="Switch theme">
+    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5a7.5 7.5 0 1 0 7.5 7.5A6 6 0 0 1 10 2.5Z" fill="currentColor"/></svg>
+  </button>
+
+  <button class="icon-button danger" id="shutdown" type="button" title="Shut down every attached instance and this server" aria-label="Shut down Codescope">
+    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M6 5.5a6 6 0 1 0 8 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+  </button>
+</header>
+
+<div class="action-toast" id="action-toast" hidden></div>
+
+<dialog class="projects-dialog" id="projects-dialog" aria-label="Projects">
+  <header>
+    <h2>Projects</h2>
+    <button class="ghost-button" id="projects-browse" type="button">Add a folder…</button>
+    <button class="icon-button" id="projects-close" type="button" aria-label="Close">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+  </header>
+  <div id="projects-body"></div>
+</dialog>
+
+<main class="layout">
+
+  <aside class="panel results" aria-label="Results">
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" data-tab="search" aria-selected="true">Search</button>
+      <button class="tab" role="tab" data-tab="files" aria-selected="false">Files</button>
+      <button class="tab" role="tab" data-tab="clones" aria-selected="false">Clones</button>
+      <button class="tab" role="tab" data-tab="health" aria-selected="false">Health</button>
+    </div>
+    <div class="panel-head">
+      <h2 id="results-title">Most referenced</h2>
+      <span class="count" id="results-count"></span>
+    </div>
+    <ol class="result-list" id="result-list"></ol>
+    <p class="empty" id="results-empty" hidden>Nothing matched. Try fewer words, or check the index status below.</p>
+  </aside>
+
+  <div class="resizer" data-resize="left" role="separator" aria-orientation="vertical" tabindex="0"
+       aria-label="Resize the results panel"></div>
+
+  <section class="panel graph" aria-label="Call graph">
+    <div class="panel-head">
+      <h2 id="graph-title">Call graph</h2>
+      <div class="graph-actions">
+        <span class="legend" id="legend-in"><i class="dot in"></i>calls in</span>
+        <span class="legend" id="legend-out"><i class="dot out"></i>calls out</span>
+        <div class="segmented" role="group" aria-label="Graph scope">
+          <button class="ghost-button" id="view-symbol" type="button" aria-pressed="true">Symbol</button>
+          <button class="ghost-button" id="view-project" type="button" aria-pressed="false">Whole project</button>
+        </div>
+        <button class="ghost-button" id="graph-back" type="button" disabled>Back</button>
+      </div>
+    </div>
+    <div class="graph-canvas" id="graph-canvas">
+      <p class="empty centered">Pick a symbol to see what calls it and what it calls.</p>
+    </div>
+    <p class="note" id="graph-note" hidden></p>
+  </section>
+
+  <div class="resizer" data-resize="right" role="separator" aria-orientation="vertical" tabindex="0"
+       aria-label="Resize the detail panel"></div>
+
+  <aside class="panel detail" aria-label="Symbol detail">
+    <div class="panel-head">
+      <h2 id="detail-title">Details</h2>
+      <span class="count" id="detail-kind"></span>
+    </div>
+    <div id="detail-body">
+      <p class="empty">Select a symbol.</p>
+    </div>
+  </aside>
+
+</main>
+
+<footer class="statusbar" id="statusbar">
+  <span class="status-item" id="status-index">…</span>
+  <span class="status-item" id="status-embed"></span>
+  <span class="status-item" id="status-advice"></span>
+  <span class="spacer"></span>
+  <span class="status-item muted" id="status-projects"></span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

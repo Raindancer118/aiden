@@ -54,6 +54,21 @@ Status of the `main` branch. Changes prior to the next official version change w
   - An `auto`-resolved embedder that degraded to the hashing fallback no longer
     replaces a working semantic index.
 
+* Codescope explorer (new):
+  - A local web UI at 127.0.0.1:24256 covering search, the call graph, a
+    whole-project dependency graph aggregated by directory, the file tree,
+    clone clusters and index health. Started with the MCP server and opened
+    once; `CODESCOPE_EXPLORER=0` disables it.
+  - One server for all projects: a second instance registers with the first
+    instead of starting its own, and the open page picks it up. The header
+    counter lists every project Codescope has run in, attached or not, and can
+    attach one that is not.
+  - Index maintenance (sync, reindex, watch start/stop) can be run from the
+    page. Each run is reported to the agent with its next tool result, worded
+    as a notification it does not have to act on. Nothing that edits, deletes
+    or runs shell commands is exposed.
+  - Panels are resizable and the layout is remembered per browser.
+
 * Codescope IDE views:
   - New `get_call_hierarchy` (resolved callers/callees via the language server) and
     `get_type_hierarchy` (supertypes/subtypes, falling back to indexed declaration
