@@ -2,6 +2,53 @@
 
 Status of the `main` branch. Changes prior to the next official version change will appear here.
 
+* Codescope index & search:
+  - Embedding models are memoized per process. Every semantic search previously
+    reconstructed the ONNX model (~2.7 s and ~0.9 GB on the default code model)
+    before it could embed the query.
+  - Embedding runs in small, length-homogeneous batches and persists each batch.
+    ONNX pads a batch to its longest member, so one long body used to inflate the
+    whole run; peak RSS for a full index of this repository dropped from ~20 GB to
+    2.3 GB (measured), and an interrupted run now keeps everything it had written.
+  - New `CODESCOPE_EMBED_MODEL` / `CODESCOPE_EMBED_BATCH` / `CODESCOPE_EMBED_THREADS`.
+  - New `codescope index build|sync|status|search` CLI, so a first index can run
+    outside the MCP server under a memory cap, and resume after being killed.
+  - Symbol bodies are indexed in full for BM25/trigram (the previous 2000-character
+    cap hid the tail of every long function from all retrievers), while the vector
+    text is a kind/name/signature header plus the head of the body.
+  - `search_code` / `search_semantic` / `find_similar_code` take `path_glob`,
+    `lang`, `kind` and `exclude_tests`, applied before each retriever's top-k, and
+    return `symbol_id`, language and a folded code preview per hit.
+  - Added an exact/prefix name retriever to the fusion; the trigram index no longer
+    contributes an unordered list to rank fusion and only participates for
+    identifier-shaped queries.
+  - New `get_code_context`: code, callers, callees and tests in one budgeted call,
+    with name-resolved edges marked `speculative` when the name is ambiguous.
+  - Clone groups report the mean *and* the weakest pair over all member pairs; the
+    previous figure averaged only the discovered edges, so a chain looked like a
+    clique. Clone clustering uses a blocked matrix product instead of one exact kNN
+    query per symbol.
+  - The diff clone gate shares one connection and one embedder across all blocks and
+    reports backend failures instead of returning an empty (clean) result.
+  - `search_regex` passes its pattern with `-e`/`--`, so a pattern starting with `-`
+    is a pattern.
+  - SQLite: explicit transactions (a reindex no longer commits once per file),
+    `executemany` for FTS rows, a SQL anti-join for pending symbols, `LIMIT 1`
+    instead of `COUNT(*)` in `has_vectors`, and mmap/cache pragmas. `close()` no
+    longer commits, so a failed reindex cannot publish partial state.
+  - An `auto`-resolved embedder that degraded to the hashing fallback no longer
+    replaces a working semantic index.
+
+* Codescope IDE views:
+  - New `get_call_hierarchy` (resolved callers/callees via the language server) and
+    `get_type_hierarchy` (supertypes/subtypes, falling back to indexed declaration
+    lines when the server does not implement `textDocument/typeHierarchy`).
+  - New `get_project_diagnostics`: a Problems view across the files git reports as
+    changed, or the whole project, grouped by file with per-severity counts. Files
+    that could not be checked are listed as skipped rather than counted as clean.
+  - Mutating dev-ops tools (`git_commit`, `create_project`, `github_*_create`) are
+    marked as editing tools, so read-only mode withholds them.
+
 * General:
   - Fix `--project-from-cwd` hijacking git worktrees nested under a Serena project. `find_project_root`
     now walks up in a single pass so the nearest project boundary wins (either a `.serena/project.yml`
