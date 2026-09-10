@@ -160,44 +160,48 @@ class Embedder(ABC):
             return texts
         return [t if len(t) <= limit else t[:limit] for t in texts]
 
+    def batch_size_for(self, longest: int) -> int:
+        """Items per forward pass for a corpus whose longest text is ``longest``.
+
+        Derived from the cost budget: a batch is padded to its longest member
+        and attention is quadratic in that length, so the batch that fits the
+        budget is ``budget / longest**2``.
+        """
+        longest = max(1, longest)
+        return max(1, min(self.batch_size, self.batch_cost // (longest * longest)))
+
     def embed_batched(self, texts: list[str]) -> Iterator[list[tuple[int, list[float]]]]:
-        """Embed ``texts`` in bounded, length-homogeneous batches, longest first.
+        """Embed ``texts`` in fixed-size batches, longest first.
 
         Yields ``[(original_index, vector), ...]`` per batch so callers can
         persist incrementally: an interrupted run only loses the batch in
-        flight. Grouping texts of similar length removes the padding waste
-        that dominates ONNX inference cost.
+        flight.
 
-        The batches run from longest to shortest, which is what actually keeps
-        peak memory flat. ONNX Runtime's allocator grows its arena to fit each
-        new tensor shape and never returns it, so feeding it steadily longer
-        batches makes memory climb for the entire run -- measured at 7 GB and
-        still rising on this repository. Starting with the largest batch
-        allocates the high-water mark once; every later, smaller batch reuses
-        it. Measured on the same workload: 2.9 GB on the first batch, then
-        flat to the end.
+        Both properties here exist to keep peak memory flat, and both were
+        arrived at by measurement rather than reasoning:
+
+        *Longest first.* ONNX Runtime grows its arena to fit each new tensor
+        shape and never returns it. Feeding it steadily larger shapes makes
+        memory climb for the whole run -- measured at 7 GB and still rising
+        on this repository. Starting with the largest batch allocates the
+        high-water mark once; every later batch fits inside it.
+
+        *A fixed item count.* That reuse only holds if later tensors are
+        smaller in *every* dimension. Varying the batch size to "use up" the
+        budget on short texts makes each batch a new shape that is larger in
+        the count dimension, and the arena grows again -- measured climbing
+        from 1.7 GB to 3 GB over one run. The count is therefore chosen once,
+        from the longest text, and held for the whole pass.
+
+        The cost is throughput on corpora of short symbols; raise
+        ``CODESCOPE_EMBED_BATCH_COST`` to trade memory back for speed.
         """
         if not texts:
             return
         order = sorted(range(len(texts)), key=lambda i: -len(texts[i]))
-        max_items = max(1, self.batch_size)
-        budget = max(1, self.batch_cost)
-
-        current: list[int] = []
-        longest = 0
-        for index in order:
-            length = max(1, len(texts[index]))
-            # Cost of adding this item: the batch is padded to its longest
-            # member and attention is quadratic in that length, so the
-            # projected cost is count * longest^2.
-            projected = max(longest, length) ** 2 * (len(current) + 1)
-            if current and (len(current) >= max_items or projected > budget):
-                yield self._embed_indices(texts, current)
-                current, longest = [], 0
-            current.append(index)
-            longest = max(longest, length)
-        if current:
-            yield self._embed_indices(texts, current)
+        size = self.batch_size_for(len(texts[order[0]]))
+        for start in range(0, len(order), size):
+            yield self._embed_indices(texts, order[start : start + size])
 
     def _embed_indices(self, texts: list[str], indices: list[int]) -> list[tuple[int, list[float]]]:
         vectors = self.embed_documents([texts[i] for i in indices])

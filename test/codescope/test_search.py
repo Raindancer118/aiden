@@ -430,30 +430,37 @@ def test_clone_group_reports_its_weakest_pair(tmp_path: Path) -> None:
     assert group.min_similarity >= 0.95  # a true clone pair: every pair holds up
 
 
-def test_batching_budgets_quadratic_padded_cost() -> None:
+def test_batch_size_follows_the_quadratic_budget() -> None:
     """Attention is quadratic in the padded length, so count x longest^2 is capped."""
     embedder = _RecordingEmbedder()
     embedder.batch_size = 64
     embedder.batch_cost = 1_000_000
 
-    short = ["x" * 10] * 60
-    long = ["y" * 900] * 3
-    list(embedder.embed_batched(short + long))
+    assert embedder.batch_size_for(1000) == 1
+    assert embedder.batch_size_for(500) == 4
+    assert embedder.batch_size_for(10) == 64  # clamped by the item cap
+    assert embedder.batch_size_for(0) >= 1
 
-    for call in embedder.calls:
-        longest = max(len(t) for t in call)
-        assert len(call) * longest**2 <= embedder.batch_cost * 2, (len(call), longest)
-    # Short symbols must NOT be throttled down to the long items' batch size.
-    assert max(len(call) for call in embedder.calls) > 10
-    # ... while the long ones go out in tiny batches.
-    long_batches = [c for c in embedder.calls if max(len(t) for t in c) > 500]
-    assert long_batches and all(len(c) <= 2 for c in long_batches)
+
+def test_batches_keep_one_shape_for_the_whole_pass() -> None:
+    """A later batch may not be larger in any dimension, or the arena regrows."""
+    embedder = _RecordingEmbedder()
+    embedder.batch_size = 64
+    embedder.batch_cost = 1_000_000
+
+    texts = ["y" * 900] * 3 + ["x" * 10] * 60
+    list(embedder.embed_batched(texts))
+
+    sizes = [len(call) for call in embedder.calls]
+    assert max(sizes) == sizes[0], sizes  # never grows past the first batch
+    longest = [max(len(t) for t in call) for call in embedder.calls]
+    assert longest == sorted(longest, reverse=True), longest
 
 
 def test_every_text_is_embedded_exactly_once_under_budgeting() -> None:
     embedder = _RecordingEmbedder()
     embedder.batch_size = 8
-    embedder.batch_cost = 250_000
+    embedder.batch_cost = 4_000_000
     texts = [f"sym{i}" + "z" * (i * 31 % 400) for i in range(97)]
 
     seen: dict[int, list[float]] = {}
@@ -535,10 +542,32 @@ def test_batches_run_longest_first() -> None:
     """
     embedder = _RecordingEmbedder()
     embedder.batch_size = 4
-    embedder.batch_cost = 10_000_000
+    embedder.batch_cost = 40_000_000
     texts = ["z" * n for n in (10, 900, 40, 1500, 70, 300)]
 
     list(embedder.embed_batched(texts))
 
     longest_per_batch = [max(len(t) for t in call) for call in embedder.calls]
     assert longest_per_batch == sorted(longest_per_batch, reverse=True), longest_per_batch
+
+
+def test_filtered_vector_search_agrees_with_an_exact_scan(indexed_multi: tuple[Path, Path]) -> None:
+    """The widened sweep is an optimization, not a different answer."""
+    from codescope.index.search import IndexStore
+
+    root, db = indexed_multi
+    engine = SearchEngine(root, db_path=db)
+    flt = SearchFilter(lang="python")
+
+    with IndexStore(db) as store:
+        qvec = engine._embed_query(store, "validate an auth token")
+        assert qvec is not None
+        allowed = engine._filtered_ids(store, flt)
+        assert allowed
+        swept = engine._vector_ids_for(store, qvec, 5, flt)
+        exact = engine._exact_scan(store, qvec, 5, allowed)
+
+    assert swept, "a filtered vector search must still return candidates"
+    assert set(swept) <= allowed
+    # Same top result either way; the sweep may order deeper ties differently.
+    assert swept[0] == exact[0]

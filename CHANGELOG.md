@@ -13,8 +13,17 @@ Status of the `main` branch. Changes prior to the next official version change w
     Runtime grows its arena for each new tensor shape without ever returning it,
     so ascending batches made memory climb for the whole run (measured at 7 GB and
     still rising). Taking the largest batch first allocates the high-water mark
-    once and every later batch reuses it - measured flat from the first batch on.
-    An interrupted run keeps everything it had written.
+    once and every later batch reuses it. That reuse only holds while later
+    tensors are smaller in *every* dimension, so the item count is chosen once
+    from the longest text and held for the pass. Measured on a full index of
+    this repository (545 files, 7080 symbols): peak 1.59 GB, flat from
+    1.54 GB to 1.63 GB across a 20-minute run, against the ~20 GB originally
+    reported. An interrupted run keeps everything it had written.
+  - Warm search latency: 44 ms median (1.2 s on the first call, which loads
+    the model), where every search previously paid the model load. A filtered
+    search costs 66 ms rather than 321 ms: the exact candidate scan is now
+    reserved for genuinely selective filters, with a widened kNN sweep for the
+    rest.
   - New `CODESCOPE_EMBED_MODEL` / `CODESCOPE_EMBED_BATCH_COST` /
     `CODESCOPE_EMBED_BATCH` / `CODESCOPE_EMBED_THREADS`.
   - New `codescope index build|sync|status|search` CLI, so a first index can run

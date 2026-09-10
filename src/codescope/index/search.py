@@ -48,10 +48,16 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:$-]{3,}$")
 _POOL_FACTOR = 10
 _POOL_MIN = 100
 
-#: With a filter active, score this many allowed candidates exactly rather
-#: than hoping they show up in an unfiltered kNN sweep.
-_EXACT_SCAN_MAX = 20_000
+#: With a *selective* filter, score the allowed candidates exactly rather than
+#: hoping they surface in an unfiltered kNN sweep. Kept small: decoding
+#: vectors into Python costs more than the sweep once the set is large, and a
+#: filter that leaves most of the corpus does not need the exact path anyway.
+_EXACT_SCAN_MAX = 2_000
 _FILTERED_KNN_OVERFETCH = 8
+
+#: If the widened sweep still cannot fill the result set, try once more this
+#: much wider before falling back to the exact scan.
+_FILTERED_KNN_WIDEN = 8
 
 #: Neighbours considered per added diff block before the self-match filter.
 _DIFF_CANDIDATES = 5
@@ -356,17 +362,29 @@ class SearchEngine:
         if not allowed:
             return []
         if len(allowed) <= _EXACT_SCAN_MAX:
-            import numpy as np
+            return self._exact_scan(store, qvec, k, allowed)
 
-            vectors = store.embeddings_for(sorted(allowed))
-            if not vectors:
-                return []
-            sids = list(vectors)
-            sims = np.asarray([vectors[s] for s in sids], dtype=np.float32) @ np.asarray(qvec, dtype=np.float32)
-            best = np.argsort(-sims)[:k]
-            return [sids[int(i)] for i in best]
-        hits = store.vector_search(qvec, min(k * _FILTERED_KNN_OVERFETCH, len(allowed)))
-        return [sid for sid, _dist in hits if sid in allowed][:k]
+        # A filter that leaves thousands of candidates is not selective, so an
+        # over-fetched sweep almost always fills the result set -- and costs a
+        # fraction of decoding every allowed vector into Python.
+        for factor in (_FILTERED_KNN_OVERFETCH, _FILTERED_KNN_OVERFETCH * _FILTERED_KNN_WIDEN):
+            hits = store.vector_search(qvec, min(k * factor, len(allowed)))
+            found = [sid for sid, _dist in hits if sid in allowed][:k]
+            if len(found) >= k:
+                return found
+        return found or self._exact_scan(store, qvec, k, allowed)
+
+    @staticmethod
+    def _exact_scan(store: IndexStore, qvec: list[float], k: int, allowed: set[int]) -> list[int]:
+        """Score every allowed candidate directly. Exact, but decodes vectors."""
+        import numpy as np
+
+        vectors = store.embeddings_for(sorted(allowed))
+        if not vectors:
+            return []
+        sids = list(vectors)
+        sims = np.asarray([vectors[s] for s in sids], dtype=np.float32) @ np.asarray(qvec, dtype=np.float32)
+        return [sids[int(i)] for i in np.argsort(-sims)[:k]]
 
     def _trigram_ids(self, store: IndexStore, substring: str, k: int, flt: SearchFilter | None = None) -> list[int]:
         """Substring matches over symbol bodies, ranked rather than arbitrary.
