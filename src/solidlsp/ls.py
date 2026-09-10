@@ -2292,6 +2292,116 @@ class SolidLanguageServer(ABC):
             return None
         return ls_types.Hover(**response)  # type: ignore
 
+    @staticmethod
+    def _is_unsupported_method(exc: Exception) -> bool:
+        """Whether the server answered "I do not implement that" (JSON-RPC -32601).
+
+        Hierarchy requests are optional LSP capabilities: several widely used
+        servers (pyright among them) implement call hierarchy but not type
+        hierarchy. A missing capability is an answer, not a failure, so the
+        caller reports "unsupported" instead of raising at the agent.
+        """
+        text = f"{exc} {getattr(exc, 'cause', '')}"
+        return "-32601" in text or "Unhandled method" in text or "MethodNotFound" in text
+
+    def request_type_hierarchy(self, relative_file_path: str, line: int, column: int, direction: str = "both") -> dict[str, list[dict]]:
+        """Resolve the type hierarchy of the symbol at a position (LSP 3.17).
+
+        This is the type-aware answer to "what does this extend, and who
+        extends it" -- the index's name-based graph cannot see inheritance.
+
+        :param direction: ``supertypes``, ``subtypes`` or ``both``.
+        :return: ``{"item": ..., "supertypes": [...], "subtypes": [...]}`` with
+            each entry as ``{name, kind, relativePath, line}``. Empty lists
+            when the language server does not implement type hierarchy.
+        """
+        empty: dict[str, Any] = {"item": None, "supertypes": [], "subtypes": [], "supported": True}
+        with self.open_file(relative_file_path):
+            try:
+                prepared = self.server.send.prepare_type_hierarchy(
+                    {
+                        "textDocument": {"uri": self._resolve_file_uri(relative_file_path)},
+                        "position": {"line": line, "character": column},
+                    }
+                )
+            except Exception as e:
+                if not self._is_unsupported_method(e):
+                    raise
+                log.info("Language server does not implement type hierarchy for %s", relative_file_path)
+                return {**empty, "supported": False}
+            if not prepared:
+                return empty
+            item = prepared[0]
+            out: dict[str, Any] = {"item": self._hierarchy_item(item), "supertypes": [], "subtypes": [], "supported": True}
+            if direction in ("supertypes", "both"):
+                supers = self.server.send.type_hierarchy_supertypes({"item": item}) or []
+                out["supertypes"] = [self._hierarchy_item(i) for i in supers]
+            if direction in ("subtypes", "both"):
+                subs = self.server.send.type_hierarchy_subtypes({"item": item}) or []
+                out["subtypes"] = [self._hierarchy_item(i) for i in subs]
+            return out
+
+    def request_call_hierarchy(self, relative_file_path: str, line: int, column: int, direction: str = "incoming") -> list[dict]:
+        """Resolve one level of the call hierarchy at a position (LSP 3.16).
+
+        Unlike the index's name-based call graph, this is resolved by the
+        language server, so overloads and same-named methods on different
+        types are distinguished.
+
+        :param direction: ``incoming`` (callers) or ``outgoing`` (callees).
+        :return: ``{name, kind, relativePath, line, callSites}`` per entry.
+        """
+        with self.open_file(relative_file_path):
+            try:
+                prepared = self.server.send.prepare_call_hierarchy(
+                    {
+                        "textDocument": {"uri": self._resolve_file_uri(relative_file_path)},
+                        "position": {"line": line, "character": column},
+                    }
+                )
+            except Exception as e:
+                if not self._is_unsupported_method(e):
+                    raise
+                log.info("Language server does not implement call hierarchy for %s", relative_file_path)
+                return []
+            if not prepared:
+                return []
+            item = prepared[0]
+            if direction == "outgoing":
+                calls = self.server.send.outgoing_calls({"item": item}) or []
+                related = [(c.get("to"), c.get("fromRanges") or []) for c in calls]
+            else:
+                calls = self.server.send.incoming_calls({"item": item}) or []
+                related = [(c.get("from"), c.get("fromRanges") or []) for c in calls]
+            out = []
+            for entry, ranges in related:
+                if not entry:
+                    continue
+                converted = self._hierarchy_item(entry)
+                converted["callSites"] = [r["start"]["line"] + 1 for r in ranges if "start" in r]
+                out.append(converted)
+            return out
+
+    def _hierarchy_item(self, item: dict) -> dict:
+        """Flatten an LSP hierarchy item into the shape Serena's tools return."""
+        uri = item.get("uri", "")
+        line = item.get("selectionRange", item.get("range", {})).get("start", {}).get("line", 0)
+        return {
+            "name": item.get("name", ""),
+            "kind": ls_types.SymbolKind(item["kind"]).name if item.get("kind") else "",
+            "relativePath": self._uri_to_relative_path(uri),
+            "line": line + 1,
+        }
+
+    def _uri_to_relative_path(self, uri: str) -> str:
+        from urllib.parse import unquote, urlparse
+
+        path = unquote(urlparse(uri).path)
+        try:
+            return str(pathlib.PurePath(path).relative_to(self.repository_root_path))
+        except ValueError:
+            return path
+
     def request_signature_help(self, relative_file_path: str, line: int, column: int) -> ls_types.SignatureHelp | None:
         """
         Raise a [textDocument/signatureHelp](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_signatureHelp)

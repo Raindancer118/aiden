@@ -6,7 +6,9 @@ register them. Add new tool modules to the imports below as milestones land.
 """
 
 from codescope.tools.devops_tools import *
+from codescope.tools.diagnostics_tools import *
 from codescope.tools.graph_tools import *
+from codescope.tools.hierarchy_tools import *
 from codescope.tools.incremental_tools import *
 from codescope.tools.index_tools import *
 from codescope.tools.info_tools import *

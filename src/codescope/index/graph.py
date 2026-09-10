@@ -16,6 +16,7 @@ overviews and blast-radius estimates.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -38,6 +39,85 @@ class FileSummary:
     language: str
     symbols: list[SymbolRef]
     depends_on: list[str]
+
+
+#: Symbol kinds that can participate in an inheritance relationship.
+TYPE_KINDS = ("class", "interface", "struct", "trait", "enum", "type", "object", "protocol", "record")
+
+#: Declaration noise to drop when reading base types out of a signature.
+_DECL_KEYWORDS = frozenset(
+    {
+        "public",
+        "private",
+        "protected",
+        "internal",
+        "abstract",
+        "final",
+        "static",
+        "sealed",
+        "open",
+        "export",
+        "default",
+        "class",
+        "struct",
+        "interface",
+        "enum",
+        "trait",
+        "object",
+        "data",
+        "record",
+        "type",
+        "where",
+        "implements",
+        "extends",
+        "case",
+        "impl",
+        "for",
+        "with",
+        "partial",
+        "const",
+        "var",
+        "val",
+        "func",
+        "fn",
+    }
+)
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
+
+
+def base_type_names(name: str, signature: str) -> list[str]:
+    """Read the base types out of a declaration line.
+
+    Deliberately syntactic and language-agnostic: it handles ``class X(A)``,
+    ``class X extends A implements B``, ``class X : A, B`` and
+    ``struct X : public Base`` alike. Callers must intersect the result with
+    the types actually defined in the project, which is what removes generic
+    parameters and standard-library names.
+    """
+    if not signature:
+        return []
+    tail = signature.split(name, 1)[1] if name in signature else signature
+    tail = tail.split("{")[0]
+    tail = tail.lstrip(" \t:(")
+    out: list[str] = []
+    for match in _IDENTIFIER_RE.finditer(tail):
+        token = match.group(0)
+        if token in _DECL_KEYWORDS or token == name:
+            continue
+        out.append(token.rsplit(".", 1)[-1])
+    return list(dict.fromkeys(out))
+
+
+@dataclass(slots=True)
+class TypeHierarchy:
+    """Inheritance around one type, as read from the index."""
+
+    item: SymbolRef | None
+    supertypes: list[SymbolRef] = field(default_factory=list)
+    subtypes: list[SymbolRef] = field(default_factory=list)
+    #: "index" here; the LSP-backed tool reports "lsp" when the server answers.
+    resolved_by: str = "index"
+    note: str = ""
 
 
 @dataclass(slots=True)
@@ -194,6 +274,49 @@ class GraphEngine:
             child = GraphNode(name=n.name, kind=n.kind, path=n.path, line=n.start_line)
             node.children.append(child)
             self._expand(store, child, depth - 1, defined, branch_visited, forward=forward)
+
+    def type_hierarchy(self, name: str) -> TypeHierarchy:
+        """Supertypes and subtypes of ``name``, derived from declaration lines.
+
+        The fallback for language servers that do not implement
+        ``textDocument/typeHierarchy`` (pyright, among others). It reads base
+        types out of the stored signature and keeps only the names that are
+        themselves defined in the project, so generic parameters and
+        third-party bases drop out. Same-named types are not disambiguated -
+        this is a structural answer, not a resolved one.
+        """
+        placeholders = ",".join("?" * len(TYPE_KINDS))
+        with IndexStore(self.db_path) as store:
+            rows = store.conn.execute(
+                f"SELECT name, kind, path, start_line, end_line, COALESCE(signature, '') FROM symbols WHERE kind IN ({placeholders})",
+                TYPE_KINDS,
+            ).fetchall()
+            defined = {r[0] for r in rows}
+
+        item: SymbolRef | None = None
+        supertypes: list[SymbolRef] = []
+        subtypes: list[SymbolRef] = []
+        by_name = {r[0]: r for r in rows}
+        for row in rows:
+            rname, kind, path, start, end, signature = row
+            bases = base_type_names(rname, signature)
+            if rname == name:
+                item = item or SymbolRef(name=rname, kind=kind, path=path, start_line=start, end_line=end)
+                for base in bases:
+                    if base in defined and base != name:
+                        b = by_name[base]
+                        supertypes.append(SymbolRef(name=b[0], kind=b[1], path=b[2], start_line=b[3], end_line=b[4]))
+            elif name in bases:
+                subtypes.append(SymbolRef(name=rname, kind=kind, path=path, start_line=start, end_line=end))
+
+        note = "" if item else f"No indexed type named {name!r}. Is the index current?"
+        return TypeHierarchy(
+            item=item,
+            supertypes=sorted(supertypes, key=lambda s: (s.path, s.start_line)),
+            subtypes=sorted(subtypes, key=lambda s: (s.path, s.start_line)),
+            resolved_by="index",
+            note=note,
+        )
 
     def file_summary(self, rel_path: str) -> FileSummary | None:
         with IndexStore(self.db_path) as store:
