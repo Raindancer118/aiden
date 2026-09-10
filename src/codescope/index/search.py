@@ -21,7 +21,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from codescope.index.embed import embedder_from_id
+from codescope.index.embed import build_snippet_embed_text, embedder_from_id
 from codescope.index.indexer import default_db_path
 from codescope.index.store import IndexStore
 
@@ -283,7 +283,7 @@ class SearchEngine:
                 return []
             try:
                 embedder = embedder_from_id(embedder_id)
-                qvec = embedder.embed_documents([snippet])[0]
+                qvec = embedder.embed_documents([build_snippet_embed_text(snippet)])[0]
                 results = store.vector_search(qvec, limit)
             except Exception:
                 return []
@@ -315,50 +315,61 @@ class SearchEngine:
         """
         if limit <= 0:
             return []
-        neighbor_k = 16
+        import numpy as np
+
         with IndexStore(self.db_path) as store:
             if not store.has_vectors():
                 raise RuntimeError("Clone detection requires embeddings; run reindex with embeddings enabled")
             rows = store.symbols_with_min_lines(min_lines)
             meta = {r[0]: CloneMember(name=r[1], kind=r[2], path=r[3], start_line=r[4], end_line=r[5], lines=r[5] - r[4] + 1) for r in rows}
-            parent: dict[int, int] = {sid: sid for sid in meta}
-            pair_sims: dict[tuple[int, int], float] = {}
+            vectors = store.embeddings_for(list(meta))
 
-            def find(x: int) -> int:
-                while parent[x] != x:
-                    parent[x] = parent[parent[x]]
-                    x = parent[x]
-                return x
+        sids = [sid for sid in meta if sid in vectors]
+        if len(sids) < 2:
+            return []
 
-            def union(a: int, b: int) -> None:
-                ra, rb = find(a), find(b)
-                if ra != rb:
-                    parent[rb] = ra
+        # One dense matrix product instead of one exact kNN query per symbol.
+        # Vectors are L2-normalized, so the Gram matrix *is* the pairwise
+        # cosine similarity; blocking the rows keeps peak memory bounded for
+        # large codebases.
+        matrix = np.asarray([vectors[sid] for sid in sids], dtype=np.float32)
+        parent: dict[int, int] = {sid: sid for sid in sids}
+        pair_sims: dict[tuple[int, int], float] = {}
 
-            for sid in meta:
-                vec = store.get_embedding(sid)
-                if vec is None:
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        block = 512
+        for start in range(0, len(sids), block):
+            sims = matrix[start : start + block] @ matrix.T
+            for local_row, col in zip(*np.nonzero(sims >= similarity), strict=True):
+                i, j = start + int(local_row), int(col)
+                if i >= j:  # upper triangle only; skips self-similarity
                     continue
-                for nsid, dist in store.vector_search(vec, neighbor_k):
-                    if nsid == sid or nsid not in meta:
-                        continue
-                    sim = _cosine_from_l2(dist)
-                    if sim < similarity:
-                        continue
-                    union(sid, nsid)
-                    pair_sims[(min(sid, nsid), max(sid, nsid))] = sim
+                a, b = sids[i], sids[j]
+                union(a, b)
+                pair_sims[(min(a, b), max(a, b))] = float(sims[local_row, col])
 
         clusters: dict[int, list[int]] = {}
-        for sid in meta:
+        for sid in sids:
             clusters.setdefault(find(sid), []).append(sid)
 
         groups: list[CloneGroup] = []
-        for sids in clusters.values():
-            if len(sids) < 2:
+        for cluster in clusters.values():
+            if len(cluster) < 2:
                 continue
-            sims = [s for (a, b), s in pair_sims.items() if a in sids and b in sids]
-            mean_sim = sum(sims) / len(sims) if sims else similarity
-            members = sorted((meta[sid] for sid in sids), key=lambda m: (m.path, m.start_line))
+            members_set = set(cluster)
+            sims_found = [v for (a, b), v in pair_sims.items() if a in members_set and b in members_set]
+            mean_sim = sum(sims_found) / len(sims_found) if sims_found else similarity
+            members = sorted((meta[sid] for sid in cluster), key=lambda m: (m.path, m.start_line))
             groups.append(CloneGroup(members=members, similarity=round(mean_sim, 6)))
 
         groups.sort(key=lambda g: (len(g.members), g.similarity), reverse=True)

@@ -12,6 +12,19 @@ Local-first by design:
 
 All embedders L2-normalize their output so cosine similarity == dot product and
 sqlite-vec's L2 distance is monotonic with cosine similarity.
+
+Two properties matter for a local-first index and are enforced here:
+
+*Bounded memory.* :meth:`Embedder.embed_batched` yields vectors in small,
+length-homogeneous batches. ONNX pads every batch to its longest member and
+attention cost grows quadratically with that length, so one long body in a
+256-item batch used to inflate peak RSS into the tens of gigabytes. Sorting by
+length before batching removes almost all of that padding waste, and yielding
+per batch lets callers persist as they go instead of buffering every vector.
+
+*Reused models.* Loading a code embedding model costs seconds and hundreds of
+megabytes, so :func:`get_embedder` / :func:`embedder_from_id` memoize instances
+per configuration. Without this, every single search reloaded the model.
 """
 
 from __future__ import annotations
@@ -21,13 +34,82 @@ import logging
 import math
 import os
 import re
+import threading
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 
 log = logging.getLogger(__name__)
 
 DEFAULT_FASTEMBED_MODEL = "jinaai/jina-embeddings-v2-base-code"
 DEFAULT_GEMINI_MODEL = "gemini-embedding-001"
+
+#: Documents per forward pass. Small on purpose: peak memory is driven by
+#: ``batch_size * longest_text_in_batch^2``, not by throughput.
+DEFAULT_BATCH_SIZE = 32
+
+#: Hard cap on the characters handed to the model. Symbol bodies are already
+#: truncated at parse time (``parser._MAX_BODY_CHARS``); this is the backstop
+#: for callers that pass raw snippets (``find_similar_code``, diff blocks).
+DEFAULT_MAX_CHARS = 4000
+
 _TOKEN_RE = re.compile(r"[^\W\d]\w*|_\w*")
+
+#: Characters of the body that go into the embedding text. Bodies are stored
+#: in full for BM25/trigram; the model only needs the head of the body, where
+#: a symbol's intent lives, plus the context header built around it.
+DEFAULT_EMBED_BODY_CHARS = 1800
+
+_ENV_MODEL = "CODESCOPE_EMBED_MODEL"
+_ENV_BATCH = "CODESCOPE_EMBED_BATCH"
+_ENV_THREADS = "CODESCOPE_EMBED_THREADS"
+
+_CACHE: dict[str, "Embedder"] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _env_int(name: str, default: int | None) -> int | None:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("Ignoring invalid %s=%r (expected an integer).", name, raw)
+        return default
+    return value if value > 0 else default
+
+
+def build_embed_text(name: str, kind: str, signature: str, body: str, body_chars: int = DEFAULT_EMBED_BODY_CHARS) -> str:
+    """Build the text that represents a symbol in vector space.
+
+    Embedding a bare body throws away what a symbol *is*: a query like
+    "validate an auth token" should match a body that never spells those words
+    but is called ``validate_token``. Prefixing the kind, name and signature
+    puts those tokens into the same vector as the implementation.
+
+    The file path is deliberately *not* part of this text. Path is already a
+    weighted BM25 field, so location is covered lexically, whereas putting it
+    in the vector makes two identical functions in different files look
+    different -- which is precisely the case clone detection must catch.
+    """
+    head = f"{kind} {name}\n{signature}".strip()
+    body = body.strip()
+    if body_chars > 0:
+        body = body[:body_chars]
+    return f"{head}\n\n{body}" if body else head
+
+
+def build_snippet_embed_text(snippet: str, body_chars: int = DEFAULT_EMBED_BODY_CHARS) -> str:
+    """Shape a raw code snippet like an indexed symbol before embedding it.
+
+    Indexed symbols carry a ``kind name`` / signature header, so embedding a
+    bare snippet compares two differently-shaped texts and systematically
+    understates the similarity of genuine duplicates. A snippet has no known
+    name or kind, but its first line is its signature, so reusing it as the
+    header restores the shape.
+    """
+    first_line = next((ln.strip() for ln in snippet.splitlines() if ln.strip()), "")
+    return build_embed_text(name="", kind="", signature=first_line, body=snippet, body_chars=body_chars)
 
 
 def _l2_normalize(vec: list[float]) -> list[float]:
@@ -42,6 +124,10 @@ class Embedder(ABC):
 
     id: str
     dim: int
+    #: Documents per forward pass; also the granularity of ``embed_batched``.
+    batch_size: int = DEFAULT_BATCH_SIZE
+    #: Characters per document handed to the backend.
+    max_chars: int = DEFAULT_MAX_CHARS
 
     @abstractmethod
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -50,6 +136,29 @@ class Embedder(ABC):
     def embed_query(self, text: str) -> list[float]:
         """Embed a single search query. Backends may specialize this."""
         return self.embed_documents([text])[0]
+
+    def _truncate(self, texts: list[str]) -> list[str]:
+        limit = self.max_chars
+        if limit <= 0:
+            return texts
+        return [t if len(t) <= limit else t[:limit] for t in texts]
+
+    def embed_batched(self, texts: list[str]) -> Iterator[list[tuple[int, list[float]]]]:
+        """Embed ``texts`` in bounded, length-homogeneous batches.
+
+        Yields ``[(original_index, vector), ...]`` per batch so callers can
+        persist incrementally: peak memory stays flat and an interrupted run
+        only loses the batch in flight. Batches group texts of similar length,
+        which removes the padding waste that dominates ONNX inference cost.
+        """
+        if not texts:
+            return
+        order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
+        size = max(1, self.batch_size)
+        for start in range(0, len(order), size):
+            idx_batch = order[start : start + size]
+            vectors = self.embed_documents([texts[i] for i in idx_batch])
+            yield list(zip(idx_batch, vectors, strict=True))
 
 
 class HashingEmbedder(Embedder):
@@ -75,12 +184,26 @@ class HashingEmbedder(Embedder):
 
 
 class FastEmbedEmbedder(Embedder):
-    """Local ONNX code-aware embeddings via fastembed."""
+    """Local ONNX code-aware embeddings via fastembed.
 
-    def __init__(self, model_name: str = DEFAULT_FASTEMBED_MODEL):
+    The model is loaded once per process (see :func:`get_embedder`). Batch size
+    and thread count are configurable because they, not the model choice, set
+    the memory ceiling of a full reindex.
+    """
+
+    def __init__(
+        self,
+        model_name: str = DEFAULT_FASTEMBED_MODEL,
+        batch_size: int | None = None,
+        threads: int | None = None,
+        max_chars: int | None = None,
+    ):
         from fastembed import TextEmbedding  # lazy: only when selected
 
-        self._model = TextEmbedding(model_name=model_name)
+        self.batch_size = batch_size or _env_int(_ENV_BATCH, DEFAULT_BATCH_SIZE) or DEFAULT_BATCH_SIZE
+        self.max_chars = max_chars if max_chars is not None else DEFAULT_MAX_CHARS
+        threads = threads if threads is not None else _env_int(_ENV_THREADS, None)
+        self._model = TextEmbedding(model_name=model_name, threads=threads)
         self.id = f"fastembed:{model_name}"
         # Probe dimensionality once.
         probe = next(iter(self._model.embed(["dimension probe"])))
@@ -89,7 +212,8 @@ class FastEmbedEmbedder(Embedder):
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        return [_l2_normalize([float(x) for x in v]) for v in self._model.embed(texts)]
+        vectors = self._model.embed(self._truncate(texts), batch_size=self.batch_size)
+        return [_l2_normalize([float(x) for x in v]) for v in vectors]
 
 
 class GeminiEmbedder(Embedder):
@@ -113,7 +237,7 @@ class GeminiEmbedder(Embedder):
         from google.genai import types
 
         out: list[list[float]] = []
-        for text in texts:  # Gemini embeds one input per request
+        for text in self._truncate(texts):  # Gemini embeds one input per request
             resp = self._client.models.embed_content(
                 model=self._model_name,
                 contents=text,
@@ -129,15 +253,10 @@ class GeminiEmbedder(Embedder):
         return self._embed([text], "CODE_RETRIEVAL_QUERY")[0]
 
 
-def get_embedder(name: str = "auto", **kwargs: object) -> Embedder:
-    """Resolve an embedder by name.
-
-    ``auto`` prefers fastembed (local, code-aware) and falls back to the
-    hashing embedder if fastembed is not installed or fails to initialize.
-    """
-    name = (name or "auto").lower()
+def _build_embedder(name: str, **kwargs: object) -> Embedder:
     if name in ("fastembed", "auto"):
         try:
+            kwargs.setdefault("model_name", os.environ.get(_ENV_MODEL) or DEFAULT_FASTEMBED_MODEL)
             return FastEmbedEmbedder(**kwargs)  # type: ignore[arg-type]
         except Exception as e:
             if name == "fastembed":
@@ -151,16 +270,55 @@ def get_embedder(name: str = "auto", **kwargs: object) -> Embedder:
     raise ValueError(f"Unknown embedder: {name!r}")
 
 
+def _cached(cache_key: str, factory) -> Embedder:  # type: ignore[no-untyped-def]
+    """Return a memoized embedder, building it outside the lock's critical path.
+
+    Model construction is slow (seconds) and must not be serialized behind a
+    lock held by another caller building a *different* model, so we build
+    optimistically and keep whichever instance landed in the cache first.
+    """
+    with _CACHE_LOCK:
+        hit = _CACHE.get(cache_key)
+    if hit is not None:
+        return hit
+    built = factory()
+    with _CACHE_LOCK:
+        return _CACHE.setdefault(cache_key, built)
+
+
+def get_embedder(name: str = "auto", **kwargs: object) -> Embedder:
+    """Resolve an embedder by name, reusing an already-loaded instance.
+
+    ``auto`` prefers fastembed (local, code-aware) and falls back to the
+    hashing embedder if fastembed is not installed or fails to initialize.
+    The model name can be overridden with ``CODESCOPE_EMBED_MODEL``.
+    """
+    name = (name or "auto").lower()
+    key = f"{name}|" + "|".join(f"{k}={v!r}" for k, v in sorted(kwargs.items()))
+    return _cached(key, lambda: _build_embedder(name, **kwargs))
+
+
 def embedder_from_id(embedder_id: str) -> Embedder:
     """Reconstruct the embedder that produced an index, from its stored id.
 
     Query embeddings must use the same backend/space as the indexed vectors.
+    Instances are cached per id: a search must never pay a model load.
     """
-    if embedder_id.startswith("hashing-"):
-        return HashingEmbedder(dim=int(embedder_id.split("-", 1)[1]))
-    if embedder_id.startswith("fastembed:"):
-        return FastEmbedEmbedder(model_name=embedder_id.split(":", 1)[1])
-    if embedder_id.startswith("gemini:"):
-        _, model_name, dim = embedder_id.split(":", 2)
-        return GeminiEmbedder(model_name=model_name, dim=int(dim))
-    raise ValueError(f"Unknown embedder id: {embedder_id!r}")
+
+    def build() -> Embedder:
+        if embedder_id.startswith("hashing-"):
+            return HashingEmbedder(dim=int(embedder_id.split("-", 1)[1]))
+        if embedder_id.startswith("fastembed:"):
+            return FastEmbedEmbedder(model_name=embedder_id.split(":", 1)[1])
+        if embedder_id.startswith("gemini:"):
+            _, model_name, dim = embedder_id.split(":", 2)
+            return GeminiEmbedder(model_name=model_name, dim=int(dim))
+        raise ValueError(f"Unknown embedder id: {embedder_id!r}")
+
+    return _cached(f"id|{embedder_id}", build)
+
+
+def clear_embedder_cache() -> None:
+    """Drop all cached embedder instances (frees the loaded models)."""
+    with _CACHE_LOCK:
+        _CACHE.clear()

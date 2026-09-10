@@ -18,6 +18,8 @@ from __future__ import annotations
 import logging
 import sqlite3
 import struct
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -105,10 +107,25 @@ class IndexStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path))
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
+        # autocommit mode: transactions are opened explicitly (see
+        # :meth:`transaction`). Python's implicit-transaction mode made every
+        # per-file SAVEPOINT release a full commit, so a reindex paid one
+        # fsync per file and ``close()`` could publish a half-written batch.
+        self.conn = sqlite3.connect(str(self.db_path), isolation_level=None)
+        # Read-heavy workload with many short-lived connections (one per tool
+        # call): WAL avoids reader/writer blocking, mmap serves pages without
+        # copying them into the process heap, and a 64 MB page cache keeps the
+        # FTS/vector B-trees resident across queries.
+        for pragma in (
+            "journal_mode=WAL",
+            "synchronous=NORMAL",
+            "foreign_keys=ON",
+            "temp_store=MEMORY",
+            "cache_size=-65536",  # KiB, negative == size limit rather than pages
+            "mmap_size=268435456",  # 256 MB
+        ):
+            self.conn.execute(f"PRAGMA {pragma}")
+        self._vec_table_cached: bool | None = None
         self.vec_enabled = self._load_sqlite_vec()
         self._init_schema()
 
@@ -130,6 +147,23 @@ class IndexStore:
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(SCHEMA_VERSION),),
         )
+
+    @contextmanager
+    def transaction(self) -> Iterator["IndexStore"]:
+        """Run a batch of writes as one transaction, rolling back on error.
+
+        Nests safely: an inner call joins the outer transaction so callers
+        (e.g. ``upsert_file``) need not know whether one is already open.
+        """
+        if self.conn.in_transaction:
+            yield self
+            return
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield self
+        except BaseException:
+            self.conn.rollback()
+            raise
         self.conn.commit()
 
     # -- meta -------------------------------------------------------------
@@ -162,6 +196,7 @@ class IndexStore:
             f"CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0("
             f"sid integer primary key, embedding float[{dim}], +path text, +lang text)"
         )
+        self._vec_table_cached = True
         self.set_meta("embedder_dim", str(dim))
         self.set_meta("embedder_id", embedder_id)
         return True
@@ -195,6 +230,7 @@ class IndexStore:
         self.conn.execute(
             f"CREATE VIRTUAL TABLE chunks_vec USING vec0(sid integer primary key, embedding float[{dim}], +path text, +lang text)"
         )
+        self._vec_table_cached = True
         if rows:
             self.conn.executemany(
                 "INSERT INTO chunks_vec(sid, embedding, path, lang) VALUES(?,?,?,?)",
@@ -204,12 +240,15 @@ class IndexStore:
         self.set_meta("embedder_id", embedder_id)
 
     def has_vectors(self) -> bool:
-        if not self.vec_enabled:
+        """Whether at least one vector is stored.
+
+        Deliberately ``LIMIT 1`` rather than ``COUNT(*)``: this runs on every
+        vector query (and once per symbol during clone detection), where a
+        full table count turned linear work into quadratic work.
+        """
+        if not self._vec_table_exists():
             return False
-        row = self.conn.execute("SELECT name FROM sqlite_master WHERE name='chunks_vec'").fetchone()
-        if row is None:
-            return False
-        return self.conn.execute("SELECT COUNT(*) FROM chunks_vec").fetchone()[0] > 0
+        return self.conn.execute("SELECT sid FROM chunks_vec LIMIT 1").fetchone() is not None
 
     def insert_embeddings(self, rows: list[tuple[int, list[float], str, str]]) -> None:
         if not self.vec_enabled or not rows:
@@ -235,24 +274,41 @@ class IndexStore:
         row = self.conn.execute("SELECT embedding FROM chunks_vec WHERE sid=?", (sid,)).fetchone()
         return _decode_vector(row[0]) if row else None
 
-    def all_symbol_rows_for_embedding(self) -> list[tuple[int, str, str, str]]:
-        """Return ``(sid, body, path, lang)`` for every indexed symbol."""
-        return self.conn.execute(
-            "SELECT s.id, f.body, s.path, files.lang "
-            "FROM symbols AS s "
-            "JOIN symbols_fts AS f ON f.rowid = s.id "
-            "JOIN files ON files.path = s.path "
-            "ORDER BY s.id"
-        ).fetchall()
+    #: ``(sid, path, lang, name, kind, signature, body)`` -- everything needed
+    #: to compose a symbol's embedding text (see ``embed.build_embed_text``).
+    _EMBED_ROW_SQL = (
+        "SELECT s.id, s.path, files.lang, s.name, s.kind, COALESCE(s.signature, ''), f.body "
+        "FROM symbols AS s "
+        "JOIN symbols_fts AS f ON f.rowid = s.id "
+        "JOIN files ON files.path = s.path "
+    )
 
-    def symbols_without_embeddings(self) -> list[tuple[int, str, str, str]]:
-        """Return ``(sid, body, path, lang)`` for symbols missing a vector."""
-        rows = self.all_symbol_rows_for_embedding()
+    def all_symbol_rows_for_embedding(self) -> list[tuple[int, str, str, str, str, str, str]]:
+        """Return the embedding source row for every indexed symbol."""
+        return self.conn.execute(self._EMBED_ROW_SQL + "ORDER BY s.id").fetchall()
+
+    def symbols_without_embeddings(self) -> list[tuple[int, str, str, str, str, str, str]]:
+        """Return the embedding source rows for symbols missing a vector.
+
+        The set difference is computed by SQLite rather than in Python: the
+        previous version materialised every symbol body *and* every stored id
+        just to discard almost all of them on an incremental reindex.
+        """
         if not self._vec_table_exists():
-            return rows
+            return self.all_symbol_rows_for_embedding()
+        return self.conn.execute(self._EMBED_ROW_SQL + "WHERE s.id NOT IN (SELECT sid FROM chunks_vec) ORDER BY s.id").fetchall()
 
-        embedded_ids = {row[0] for row in self.conn.execute("SELECT sid FROM chunks_vec")}
-        return [row for row in rows if row[0] not in embedded_ids]
+    def embeddings_for(self, sids: list[int]) -> dict[int, list[float]]:
+        """Bulk-load stored embeddings for ``sids`` in one query."""
+        if not sids or not self._vec_table_exists():
+            return {}
+        out: dict[int, list[float]] = {}
+        for start in range(0, len(sids), 900):  # stay under SQLITE_MAX_VARIABLE_NUMBER
+            chunk = sids[start : start + 900]
+            placeholders = ",".join("?" * len(chunk))
+            for sid, blob in self.conn.execute(f"SELECT sid, embedding FROM chunks_vec WHERE sid IN ({placeholders})", chunk):
+                out[sid] = _decode_vector(blob)
+        return out
 
     def symbols_with_min_lines(self, min_lines: int) -> list[tuple[int, str, str, str, int, int, str]]:
         """Symbols whose body spans at least ``min_lines`` lines.
@@ -265,9 +321,13 @@ class IndexStore:
         ).fetchall()
 
     def _vec_table_exists(self) -> bool:
+        """Cached ``sqlite_master`` lookup; invalidated by create/drop below."""
         if not self.vec_enabled:
             return False
-        return self.conn.execute("SELECT name FROM sqlite_master WHERE name='chunks_vec'").fetchone() is not None
+        if self._vec_table_cached is None:
+            row = self.conn.execute("SELECT name FROM sqlite_master WHERE name='chunks_vec'").fetchone()
+            self._vec_table_cached = row is not None
+        return self._vec_table_cached
 
     # -- change detection -------------------------------------------------
 
@@ -318,19 +378,26 @@ class IndexStore:
                 (path, lang, file_hash, mtime, size, indexed_at),
             )
             inserted: list[tuple[int, str, str, str]] = []
-            for s in symbols:
-                cur.execute(
+            if symbols:
+                cur.executemany(
                     "INSERT INTO symbols(path, name, kind, start_line, start_col, end_line, end_col, signature) VALUES(?,?,?,?,?,?,?,?)",
-                    (path, s.name, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.signature),
+                    [(path, s.name, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.signature) for s in symbols],
                 )
-                sid = cur.lastrowid
-                assert sid is not None
-                cur.execute(
+                # All previous rows for ``path`` were just deleted, so the ids
+                # of the batch we inserted are exactly this file's ids, in
+                # insertion order -- the FTS rowids must match them.
+                sids = [r[0] for r in cur.execute("SELECT id FROM symbols WHERE path=? ORDER BY id", (path,))]
+                if len(sids) != len(symbols):  # pragma: no cover - defensive
+                    raise RuntimeError(f"symbol id mismatch for {path}: {len(sids)} stored vs {len(symbols)} parsed")
+                cur.executemany(
                     "INSERT INTO symbols_fts(rowid, name, path, body, kind) VALUES(?,?,?,?,?)",
-                    (sid, s.name, path, s.body, s.kind),
+                    [(sid, s.name, path, s.body, s.kind) for sid, s in zip(sids, symbols, strict=True)],
                 )
-                cur.execute("INSERT INTO symbols_trgm(rowid, body) VALUES(?,?)", (sid, s.body))
-                inserted.append((sid, s.body, path, lang))
+                cur.executemany(
+                    "INSERT INTO symbols_trgm(rowid, body) VALUES(?,?)",
+                    [(sid, s.body) for sid, s in zip(sids, symbols, strict=True)],
+                )
+                inserted = [(sid, s.body, path, lang) for sid, s in zip(sids, symbols, strict=True)]
             if refs:
                 cur.executemany(
                     "INSERT INTO refs(path, name, kind, line, col) VALUES(?,?,?,?,?)",
@@ -344,10 +411,19 @@ class IndexStore:
         return inserted
 
     def commit(self) -> None:
-        self.conn.commit()
+        """Commit an open transaction (no-op in autocommit mode)."""
+        if self.conn.in_transaction:
+            self.conn.commit()
 
     def close(self) -> None:
-        self.conn.commit()
+        """Close the connection, discarding any *uncommitted* work.
+
+        Deliberately does not commit: ``close()`` runs from ``finally``
+        blocks, where committing would publish the partial state of a failed
+        reindex. Successful paths commit explicitly.
+        """
+        if self.conn.in_transaction:
+            self.conn.rollback()
         self.conn.close()
 
     # -- stats ------------------------------------------------------------

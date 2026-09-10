@@ -61,6 +61,7 @@ dependencies = [
   "watchfiles==1.2.0",                # Rust-notify backend, debounced file watching
   "pygit2==1.19.2",                   # fast git status/diff for incremental reindex
   "fastembed==0.8.0",                 # local-first, code-aware semantic embeddings (ONNX)
+  "numpy>=1.26,<3",                   # vectorized clone clustering (also a fastembed dep)
   # google-genai (optional Gemini cloud embeddings) is in the [google] extra
 ]
 

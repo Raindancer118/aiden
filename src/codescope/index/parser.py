@@ -25,7 +25,13 @@ from codescope.index.languages import LanguageSpec, spec_for_path
 log = logging.getLogger(__name__)
 
 # Caps to keep the index compact.
-_MAX_BODY_CHARS = 2000
+#
+# The body cap is deliberately generous: this text is what BM25 and the
+# trigram index search over, so a tight cap made the tail of every long
+# function invisible to *all* retrievers while hits still reported the full
+# line range. The much smaller budget the embedding model needs is applied
+# separately when the embedding text is built (see ``embed.build_embed_text``).
+_MAX_BODY_CHARS = 20_000
 _MAX_SIGNATURE_CHARS = 240
 
 _NAME_DEF_PREFIX = "name.definition."

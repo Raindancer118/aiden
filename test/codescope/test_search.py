@@ -269,3 +269,68 @@ def test_search_tools_registered() -> None:
         "detect_clones_in_diff",
     ):
         assert t in names
+
+
+# -- embedder caching & bounded batching -------------------------------------
+
+
+class _RecordingEmbedder(HashingEmbedder):
+    """Hashing embedder that records the batches it was asked to embed."""
+
+    def __init__(self, dim: int = 32) -> None:
+        super().__init__(dim=dim)
+        self.batch_size = 4
+        self.calls: list[list[str]] = []
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.calls.append(list(texts))
+        return super().embed_documents(texts)
+
+
+def test_embed_batched_bounds_batch_size_and_covers_every_text() -> None:
+    embedder = _RecordingEmbedder()
+    texts = [f"symbol_{i} " + "x" * (i * 7) for i in range(11)]
+
+    seen: dict[int, list[float]] = {}
+    for batch in embedder.embed_batched(texts):
+        assert len(batch) <= embedder.batch_size
+        for index, vector in batch:
+            seen[index] = vector
+
+    assert sorted(seen) == list(range(len(texts)))
+    assert all(len(call) <= embedder.batch_size for call in embedder.calls)
+
+
+def test_embed_batched_groups_texts_of_similar_length() -> None:
+    """Length-homogeneous batches are what keeps ONNX padding (and RSS) low."""
+    embedder = _RecordingEmbedder()
+    texts = ["x" * n for n in (1, 5000, 2, 5000, 3, 5000, 4, 5000)]
+
+    list(embedder.embed_batched(texts))
+
+    # The four short texts must never share a batch with a 5000-char body.
+    for call in embedder.calls:
+        lengths = [len(t) for t in call]
+        assert max(lengths) - min(lengths) < 100
+
+
+def test_truncation_caps_oversized_input() -> None:
+    """Backends that pad to the longest item need a hard ceiling per document."""
+    embedder = _RecordingEmbedder()
+    embedder.max_chars = 50
+    assert [len(t) for t in embedder._truncate(["y" * 5000, "short"])] == [50, 5]
+
+    embedder.max_chars = 0  # 0 disables truncation
+    assert len(embedder._truncate(["y" * 5000])[0]) == 5000
+
+
+def test_embedder_from_id_is_cached() -> None:
+    """A search must never pay for reloading the embedding model."""
+    from codescope.index.embed import clear_embedder_cache, get_embedder
+
+    clear_embedder_cache()
+    first = embedder_from_id("hashing-64")
+    second = embedder_from_id("hashing-64")
+    assert first is second
+    assert get_embedder("hashing", dim=64) is get_embedder("hashing", dim=64)
+    assert embedder_from_id("hashing-128") is not first

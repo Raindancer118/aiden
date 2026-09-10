@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import blake3
 import pathspec
 
-from codescope.index.embed import Embedder, get_embedder
+from codescope.index.embed import Embedder, HashingEmbedder, build_embed_text, get_embedder
 from codescope.index.languages import spec_for_path
 from codescope.index.parser import TreeSitterParser
 from codescope.index.store import IndexStats, IndexStore
@@ -63,6 +63,10 @@ _DEFAULT_IGNORE_DIRS = frozenset(
 )
 
 _MAX_FILE_BYTES = 2_000_000  # skip very large files (likely generated/vendored)
+
+#: Files per write transaction during a full reindex. Bounded so a long run
+#: keeps releasing the SQLite writer lock instead of blocking searches.
+_COMMIT_EVERY_FILES = 200
 
 
 @dataclass(slots=True)
@@ -179,16 +183,24 @@ class Indexer:
             return "error", []
         return "indexed", inserted
 
-    def _resolve_embedder(self, embeddings: bool, embedder: Embedder | None) -> Embedder | None:
+    def _resolve_embedder(self, embeddings: bool, embedder: Embedder | None) -> tuple[Embedder | None, bool]:
+        """Resolve the embedder to use.
+
+        :return: ``(embedder, explicit)``. ``explicit`` is True when the
+            caller named the backend, and False when it came from ``auto``
+            resolution -- which may silently have degraded to the hashing
+            fallback and must therefore never trigger a destructive rebuild
+            of a real semantic index (see :meth:`_update_embeddings`).
+        """
         if not embeddings:
-            return None
+            return None, False
         if embedder is not None:
-            return embedder
+            return embedder, True
         try:
-            return get_embedder(self.embedder_name)
+            return get_embedder(self.embedder_name), self.embedder_name.lower() not in ("", "auto")
         except Exception as e:  # pragma: no cover - depends on optional deps
             log.warning("Embeddings requested but no embedder available: %s", e)
-            return None
+            return None, False
 
     def reindex(self, *, force: bool = False, embeddings: bool = True, embedder: Embedder | None = None) -> ReindexReport:
         """(Re)index the whole project, pruning files that no longer exist.
@@ -204,29 +216,34 @@ class Indexer:
         try:
             self._gitignore = self._load_gitignore()
 
+            batch: list[tuple[Path, str]] = []
             for abs_path, rel in self.iter_source_files():
                 seen.add(rel)
-                outcome, _inserted = self.index_file(store, abs_path, rel, force=force)
-                if outcome == "indexed":
-                    indexed += 1
-                elif outcome == "error":
-                    errors += 1
-                else:
-                    skipped += 1
+                batch.append((abs_path, rel))
+                if len(batch) < _COMMIT_EVERY_FILES:
+                    continue
+                counts = self._index_batch(store, batch, force=force)
+                indexed, errors, skipped = indexed + counts[0], errors + counts[1], skipped + counts[2]
+                batch.clear()
+            if batch:
+                counts = self._index_batch(store, batch, force=force)
+                indexed, errors, skipped = indexed + counts[0], errors + counts[1], skipped + counts[2]
 
             # Prune files removed from disk.
             removed = 0
-            for stale in store.indexed_paths() - seen:
-                store.delete_file(stale)
-                removed += 1
+            with store.transaction():
+                for stale in store.indexed_paths() - seen:
+                    store.delete_file(stale)
+                    removed += 1
 
             # persist the lexical index before model loading or vectorization,
             # both of which may be slow or depend on optional external assets.
             store.commit()
 
-            resolved_embedder = self._resolve_embedder(embeddings, embedder) if store.vec_enabled else None
-            if resolved_embedder is not None:
-                self._update_embeddings(store, resolved_embedder)
+            if store.vec_enabled:
+                resolved_embedder, explicit = self._resolve_embedder(embeddings, embedder)
+                if resolved_embedder is not None:
+                    self._update_embeddings(store, resolved_embedder, explicit=explicit)
 
             stats = store.stats()
         finally:
@@ -239,6 +256,25 @@ class Indexer:
             stats=stats,
             duration_s=round(time.time() - start, 3),
         )
+
+    def _index_batch(self, store: IndexStore, batch: list[tuple[Path, str]], *, force: bool) -> tuple[int, int, int]:
+        """Index a group of files in one transaction.
+
+        Grouping matters: each file's savepoint would otherwise commit on its
+        own, so a large reindex paid one durable write per file. The group is
+        bounded so a long reindex still releases the writer lock regularly.
+        """
+        indexed = errors = skipped = 0
+        with store.transaction():
+            for abs_path, rel in batch:
+                outcome, _inserted = self.index_file(store, abs_path, rel, force=force)
+                if outcome == "indexed":
+                    indexed += 1
+                elif outcome == "error":
+                    errors += 1
+                else:
+                    skipped += 1
+        return indexed, errors, skipped
 
     def reindex_paths(
         self,
@@ -306,9 +342,10 @@ class Indexer:
 
             store.commit()
 
-            resolved_embedder = self._resolve_embedder(embeddings, embedder) if store.vec_enabled else None
-            if resolved_embedder is not None:
-                self._update_embeddings(store, resolved_embedder)
+            if store.vec_enabled:
+                resolved_embedder, explicit = self._resolve_embedder(embeddings, embedder)
+                if resolved_embedder is not None:
+                    self._update_embeddings(store, resolved_embedder, explicit=explicit)
 
             stats = store.stats()
         finally:
@@ -322,7 +359,7 @@ class Indexer:
             duration_s=round(time.time() - start, 3),
         )
 
-    def _update_embeddings(self, store: IndexStore, embedder: Embedder) -> None:
+    def _update_embeddings(self, store: IndexStore, embedder: Embedder, *, explicit: bool = True) -> None:
         """Backfill vectors while preserving the last complete vector index on failure.
 
         An embedder change requires re-embedding every symbol, since the
@@ -333,11 +370,24 @@ class Indexer:
         the last working index untouched instead of a `DROP TABLE` (which
         auto-commits and can't be undone by a transaction rollback) destroying
         it up front.
+
+        The backfill path (no embedder change) is the common one and writes
+        incrementally: vectors are persisted batch by batch, so peak memory
+        stays flat and an interrupted run keeps everything already written.
         """
         if store.embedder_changed(embedder.dim, embedder.id):
-            rows = [(sid, body, path, lang) for sid, body, path, lang in store.all_symbol_rows_for_embedding() if body.strip()]
-            vectors = embedder.embed_documents([body for _sid, body, _p, _l in rows]) if rows else []
-            embedded = [(sid, vec, path, lang) for (sid, _body, path, lang), vec in zip(rows, vectors, strict=True)]
+            if not explicit and isinstance(embedder, HashingEmbedder) and not (store.get_meta("embedder_id") or "").startswith("hashing-"):
+                # ``auto`` degrades to the hashing fallback when the real
+                # backend fails to load. Treating that as an intentional
+                # embedder change would silently replace a semantic index
+                # with lexical hash vectors, so leave the index alone.
+                log.warning(
+                    "Semantic backend unavailable; keeping existing %s vectors instead of rebuilding with the hashing fallback.",
+                    store.get_meta("embedder_id"),
+                )
+                return
+            rows = [row for row in store.all_symbol_rows_for_embedding() if row[6].strip()]
+            embedded = self._embed_rows(embedder, rows)
             store.rebuild_vec_table(embedder.dim, embedder.id, embedded)
             store.commit()
             return
@@ -349,12 +399,40 @@ class Indexer:
         store.commit()
 
     @staticmethod
-    def _embed_pending(store: IndexStore, embedder: Embedder, pending: list[tuple[int, str, str, str]]) -> None:
-        rows = [(sid, body, path, lang) for sid, body, path, lang in pending if body.strip()]
+    def _embed_texts(rows: list[tuple[int, str, str, str, str, str, str]]) -> list[str]:
+        """Compose the context-enriched text embedded for each symbol row."""
+        return [build_embed_text(name, kind, signature, body) for _sid, _path, _lang, name, kind, signature, body in rows]
+
+    @classmethod
+    def _embed_rows(
+        cls, embedder: Embedder, rows: list[tuple[int, str, str, str, str, str, str]]
+    ) -> list[tuple[int, list[float], str, str]]:
+        """Embed symbol rows, buffering the result.
+
+        Used only for the staged full rebuild, which must hold every vector
+        before it may replace the previous table. Vectors are ~3 KB each, so
+        buffering them is cheap; it is the *model activations* that were the
+        memory problem, and ``embed_batched`` bounds those.
+        """
+        out: list[tuple[int, list[float], str, str]] = []
+        for batch in embedder.embed_batched(cls._embed_texts(rows)):
+            for index, vector in batch:
+                out.append((rows[index][0], vector, rows[index][1], rows[index][2]))
+        return out
+
+    @classmethod
+    def _embed_pending(cls, store: IndexStore, embedder: Embedder, pending: list[tuple[int, str, str, str, str, str, str]]) -> None:
+        """Embed and persist missing vectors batch by batch (interruptible)."""
+        rows = [row for row in pending if row[6].strip()]
         if not rows:
             return
-        vectors = embedder.embed_documents([body for _sid, body, _p, _l in rows])
-        store.insert_embeddings([(sid, vec, path, lang) for (sid, _body, path, lang), vec in zip(rows, vectors, strict=True)])
+        done = 0
+        for batch in embedder.embed_batched(cls._embed_texts(rows)):
+            store.insert_embeddings([(rows[i][0], vec, rows[i][1], rows[i][2]) for i, vec in batch])
+            store.commit()
+            done += len(batch)
+            if done % 512 < len(batch):
+                log.info("Embedded %d/%d symbols", done, len(rows))
 
     def status(self) -> IndexStats:
         store = IndexStore(self.db_path)
