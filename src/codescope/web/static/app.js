@@ -49,6 +49,18 @@ async function api(path, params) {
   return response.json();
 }
 
+/* Handed to the page in its own HTML, which a cross-origin caller cannot
+ * read. Every state-changing request carries it. */
+const TOKEN = document.querySelector('meta[name="codescope-token"]')?.content || "";
+
+function post(path, body) {
+  return fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Codescope-Token": TOKEN },
+    body: JSON.stringify(body || {}),
+  });
+}
+
 function projectPath(suffix) {
   return `/api/projects/${state.projectId}/${suffix}`;
 }
@@ -589,11 +601,7 @@ async function runAction(action, button) {
   if (!state.projectId) return;
   button.disabled = true;
   try {
-    await fetch(projectPath(`actions/${action}`), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-    });
+    await post(projectPath(`actions/${action}`), {});
     toast(`${action} started…`);
   } catch (error) {
     toast(`${action} could not be started: ${error.message}`, "failed");
@@ -936,11 +944,7 @@ async function renderKnownProjects() {
       forget.type = "button";
       forget.title = "Remove it from this list. The index on disk is left alone.";
       forget.addEventListener("click", async () => {
-        await fetch("/api/known/forget", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ root: project.root }),
-        });
+        await post("/api/known/forget", { root: project.root });
         renderKnownProjects();
       });
       row.append(forget);
@@ -950,11 +954,7 @@ async function renderKnownProjects() {
 }
 
 async function startProject(root) {
-  const response = await fetch("/api/projects", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ root }),
-  });
+  const response = await post("/api/projects", { root });
   const data = await response.json();
   if (!response.ok) {
     toast(data.error || "Could not open that project", "failed");
@@ -1020,7 +1020,7 @@ document.getElementById("shutdown").addEventListener("click", async () => {
     return;
   }
   try {
-    const data = await (await fetch("/api/shutdown", { method: "POST" })).json();
+    const data = await (await post("/api/shutdown")).json();
     toast(`Stopped ${data.stopped.length} instance(s). This server is shutting down.`, "done");
   } catch {
     toast("The server stopped before it could answer.", "done");

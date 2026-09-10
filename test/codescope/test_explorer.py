@@ -39,7 +39,10 @@ def client(project: Path):  # type: ignore[no-untyped-def]
     registry.register(project, pid=4242)
     app = explorer.build_app(registry)
     app.config.update(TESTING=True)
-    return app.test_client(), registry, explorer._project_id(project.resolve())
+    client = app.test_client()
+    # Writes are token-gated; the real page gets the token in its own HTML.
+    client.environ_base["HTTP_X_CODESCOPE_TOKEN"] = explorer.explorer_token()
+    return client, registry, explorer._project_id(project.resolve())
 
 
 # -- registry and attaching --------------------------------------------------
@@ -194,6 +197,7 @@ def test_shutdown_signals_instances_then_itself(client, monkeypatch: pytest.Monk
     stopped_self: list[float] = []
     monkeypatch.setattr("os.kill", lambda pid, sig: signalled.append(pid))
     monkeypatch.setattr(explorer, "stop_this_process", lambda delay_s=0.5: stopped_self.append(delay_s))
+    monkeypatch.setattr(explorer, "is_own_codescope_process", lambda pid: True)
 
     payload = http.post("/api/shutdown").get_json()
     assert [entry["pid"] for entry in payload["stopped"]] == [4242]
@@ -210,3 +214,91 @@ def test_static_page_is_served(client) -> None:  # type: ignore[no-untyped-def]
     assert "Codescope Explorer" in body
     assert "app.js" in body
     assert json.loads(http.get("/api/projects").get_data(as_text=True))["projects"]
+
+
+# -- hardening ---------------------------------------------------------------
+#
+# The explorer listens on loopback, which is not by itself a boundary: a page
+# the user visits can resolve a name to 127.0.0.1 and POST to it, and any
+# local process can talk to it. Every state-changing route is therefore
+# origin-checked and token-gated, and nothing it is told about a process is
+# taken on trust.
+
+
+def test_state_changing_routes_require_the_token(client) -> None:  # type: ignore[no-untyped-def]
+    http, _registry, project_id = client
+
+    for path in ("/api/projects", "/api/shutdown", f"/api/projects/{project_id}/actions/sync", "/api/known/forget"):
+        response = http.post(path, json={"root": "/tmp"}, headers={"X-Codescope-Token": "wrong"})
+        assert response.status_code == 403, f"{path} accepted a bad token"
+        assert http.post(path, json={"root": "/tmp"}, headers={"X-Codescope-Token": ""}).status_code == 403
+
+    # Reads stay open: the page needs them and they change nothing.
+    assert http.get("/api/projects").status_code == 200
+
+
+def test_a_foreign_origin_is_rejected(client) -> None:  # type: ignore[no-untyped-def]
+    """A page on another origin must not be able to drive the explorer."""
+    http, _registry, _project_id = client
+    response = http.post(
+        "/api/shutdown",
+        headers={"X-Codescope-Token": explorer.explorer_token(), "Origin": "https://evil.example"},
+    )
+    assert response.status_code == 403
+
+
+def test_a_rebound_host_header_is_rejected(client) -> None:  # type: ignore[no-untyped-def]
+    """DNS rebinding gives an attacker loopback, but not our Host name."""
+    http, _registry, _project_id = client
+    response = http.get("/api/projects", headers={"Host": "attacker.example"})
+    assert response.status_code == 403
+
+
+def test_registration_is_confined_to_the_home_directory(client) -> None:  # type: ignore[no-untyped-def]
+    http, _registry, _project_id = client
+    response = http.post("/api/projects", json={"root": "/etc"}, headers={"X-Codescope-Token": explorer.explorer_token()})
+    assert response.status_code == 400
+    assert "home" in response.get_json()["error"].lower()
+
+
+def test_shutdown_refuses_a_pid_it_cannot_vouch_for(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A registered pid is a claim, not proof. Verify before signalling."""
+    pytest.importorskip("flask")
+    registry = explorer.ProjectRegistry()
+    registry.history = explorer.ProjectHistory(project / ".history.json")
+    registry.register(project, pid=4242)  # never checked at registration time
+    app = explorer.build_app(registry)
+    app.config.update(TESTING=True)
+
+    signalled: list[int] = []
+    monkeypatch.setattr("os.kill", lambda pid, sig: signalled.append(pid))
+    monkeypatch.setattr(explorer, "stop_this_process", lambda delay_s=0.5: None)
+    monkeypatch.setattr(explorer, "is_own_codescope_process", lambda pid: False)
+
+    payload = app.test_client().post("/api/shutdown", headers={"X-Codescope-Token": explorer.explorer_token()}).get_json()
+    assert signalled == [], "a pid that failed verification must not be signalled"
+    assert payload["stopped"] == []
+    assert payload["refused"] and payload["refused"][0]["pid"] == 4242
+
+
+def test_process_verification_accepts_this_process_and_rejects_pid_one() -> None:
+    assert explorer.is_own_codescope_process(__import__("os").getpid()) is True
+    # pid 1 is init: a different user and not a Codescope process.
+    assert explorer.is_own_codescope_process(1) is False
+
+
+def test_the_token_file_is_private(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(explorer, "_TOKEN_FILE", tmp_path / "token")
+    explorer.explorer_token.cache_clear()
+    token = explorer.explorer_token()
+    assert len(token) >= 32
+    assert explorer.explorer_token() == token, "the token must be stable across calls"
+    assert (tmp_path / "token").stat().st_mode & 0o077 == 0, "the token must not be group/world readable"
+    explorer.explorer_token.cache_clear()
+
+
+def test_the_page_carries_the_token_so_the_browser_can_use_it(client) -> None:  # type: ignore[no-untyped-def]
+    http, _registry, _project_id = client
+    body = http.get("/").get_data(as_text=True)
+    assert explorer.explorer_token() in body
+    assert "__CODESCOPE_TOKEN__" not in body

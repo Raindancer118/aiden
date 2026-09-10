@@ -68,6 +68,12 @@ Status of the `main` branch. Changes prior to the next official version change w
     as a notification it does not have to act on. Nothing that edits, deletes
     or runs shell commands is exposed.
   - Panels are resizable and the layout is remembered per browser.
+  - Hardened against the fact that loopback is not a boundary: loopback-only
+    `Host` allowlist (DNS rebinding), `Origin` check, a 0600 per-install token
+    required for every state-changing request and handed to the page in its
+    own HTML, registration confined to the home directory, and verification
+    that a registered pid really is a live Codescope process owned by this
+    user before shutdown signals it.
 
 * Codescope IDE views:
   - New `get_call_hierarchy` (resolved callers/callees via the language server) and

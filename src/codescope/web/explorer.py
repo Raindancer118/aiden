@@ -14,11 +14,15 @@ and the working tree; it never writes to either.
 from __future__ import annotations
 
 import logging
+import os
+import secrets
 import socket
 import threading
 import time
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +42,16 @@ _STATIC_DIR = Path(__file__).parent / "static"
 #: Every project Codescope has ever been used in, so the explorer can list
 #: them when no instance is currently attached to them.
 _HISTORY_FILE = Path.home() / ".codescope" / "projects.json"
+
+#: Shared secret for state-changing requests, readable only by this user.
+#: Loopback is not a boundary on its own: any local process can connect, and
+#: a page the user visits can point a hostname at 127.0.0.1 and POST to it.
+_TOKEN_FILE = Path.home() / ".codescope" / "token"
+_TOKEN_HEADER = "X-Codescope-Token"
+
+#: Host names that may address the explorer. A rebound DNS name resolves to
+#: loopback but still arrives with the attacker's Host header.
+_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
 _server_lock = threading.Lock()
 #: The server hosted by *this* process, if any. Held in a container so the
@@ -120,6 +134,66 @@ class RegisteredProject:
     def for_root(cls, root: str | Path, pid: int | None = None) -> "RegisteredProject":
         resolved = Path(root).resolve()
         return cls(id=_project_id(resolved), name=resolved.name, root=str(resolved), pid=pid)
+
+
+@lru_cache(maxsize=1)
+def explorer_token() -> str:
+    """The per-install secret, created on first use with mode 0600."""
+    try:
+        existing = _TOKEN_FILE.read_text(encoding="utf-8").strip()
+        if len(existing) >= 32:
+            return existing
+    except OSError:
+        pass
+
+    token = secrets.token_urlsafe(32)
+    try:
+        _TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Create with 0600 from the start rather than chmod-ing afterwards,
+        # which would leave a window where the secret is world-readable.
+        fd = os.open(_TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(token)
+    except OSError as e:  # pragma: no cover - read-only home
+        log.warning("Could not persist the explorer token: %s", e)
+    return token
+
+
+def is_own_codescope_process(pid: int) -> bool:
+    """Whether ``pid`` is a live Codescope process belonging to this user.
+
+    A registered pid is a claim made over the network, so it is never
+    signalled on trust: an attacker who can reach the API would otherwise
+    have an arbitrary-process-kill primitive for everything this user owns.
+    """
+    if pid <= 1:
+        return False
+    try:
+        import psutil
+
+        process = psutil.Process(pid)
+        if process.uids().real != os.getuid():
+            return False
+        haystack = " ".join(process.cmdline() or []).lower()
+    except Exception:
+        return False
+    return "codescope" in haystack or pid == os.getpid()
+
+
+def _under_home(root: str | Path) -> Path | None:
+    """Resolve ``root`` if it lies inside the user's home, else ``None``.
+
+    The same confinement the directory browser applies. Registering a path
+    makes the API read an index under it and report what it finds, so the
+    reachable set has to be bounded somewhere.
+    """
+    home = Path.home().resolve()
+    try:
+        resolved = Path(root).resolve()
+        resolved.relative_to(home)
+    except (OSError, ValueError):
+        return None
+    return resolved
 
 
 def _project_id(root: Path) -> str:
@@ -215,9 +289,32 @@ class ProjectRegistry:
 
 def build_app(registry: ProjectRegistry):  # type: ignore[no-untyped-def]
     """Build the Flask app. Imported lazily so the CLI stays fast."""
-    from flask import Flask, jsonify, request, send_from_directory
+    from flask import Flask, Response, jsonify, request, send_from_directory
 
     app = Flask(__name__, static_folder=None)
+
+    #: Reads are open to anything that already reached loopback with the
+    #: right Host; writes additionally need the token, which only a
+    #: same-origin page (or a local process reading ~/.codescope/token) has.
+    safe_methods = {"GET", "HEAD", "OPTIONS"}
+
+    @app.before_request
+    def guard():  # type: ignore[no-untyped-def]
+        host = request.host.rsplit(":", 1)[0] if request.host else ""
+        if host not in _ALLOWED_HOSTS:
+            # DNS rebinding: the request reaches loopback, but under a name
+            # we never serve.
+            return jsonify({"error": "This explorer only answers to localhost."}), 403
+
+        origin = request.headers.get("Origin")
+        if origin and urlparse(origin).hostname not in _ALLOWED_HOSTS:
+            return jsonify({"error": "Cross-origin requests are not accepted."}), 403
+
+        if request.method in safe_methods:
+            return None
+        if not secrets.compare_digest(request.headers.get(_TOKEN_HEADER, ""), explorer_token()):
+            return jsonify({"error": "Missing or invalid explorer token."}), 403
+        return None
 
     def _project_or_404(project_id: str):  # type: ignore[no-untyped-def]
         project = registry.get(project_id)
@@ -229,7 +326,11 @@ def build_app(registry: ProjectRegistry):  # type: ignore[no-untyped-def]
 
     @app.get("/")
     def index():  # type: ignore[no-untyped-def]
-        return send_from_directory(_STATIC_DIR, "index.html")
+        # The token is handed to the page, not to the network: a
+        # cross-origin request cannot read this response, so it cannot
+        # learn the value it would need to POST with.
+        page = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        return Response(page.replace("__CODESCOPE_TOKEN__", explorer_token()), mimetype="text/html")
 
     @app.get("/<path:filename>")
     def static_file(filename: str):  # type: ignore[no-untyped-def]
@@ -247,9 +348,12 @@ def build_app(registry: ProjectRegistry):  # type: ignore[no-untyped-def]
         root = payload.get("root")
         if not root:
             return jsonify({"error": "root is required"}), 400
-        if not Path(root).is_dir():
+        resolved = _under_home(root)
+        if resolved is None:
+            return jsonify({"error": f"Only paths inside your home directory can be registered: {root}"}), 400
+        if not resolved.is_dir():
             return jsonify({"error": f"Not a directory: {root}"}), 400
-        return jsonify(asdict(registry.register(root, payload.get("pid"))))
+        return jsonify(asdict(registry.register(resolved, payload.get("pid"))))
 
     @app.get("/api/known")
     def known_projects():  # type: ignore[no-untyped-def]
@@ -295,13 +399,18 @@ def build_app(registry: ProjectRegistry):  # type: ignore[no-untyped-def]
         Explicitly confirmed in the UI: it terminates other processes, which
         is the one thing here that reaches outside the explorer.
         """
-        import os
         import signal
 
-        stopped, failed = [], []
+        stopped, failed, refused = [], [], []
         for project in registry.all():
             pid = project.pid
             if not pid or pid == os.getpid():
+                continue
+            if not is_own_codescope_process(pid):
+                # The pid arrived over the API. Signalling it unchecked
+                # would let anything that can reach this endpoint kill any
+                # process the user owns.
+                refused.append({"project": project.name, "pid": pid, "reason": "not a verifiable Codescope process"})
                 continue
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -310,7 +419,7 @@ def build_app(registry: ProjectRegistry):  # type: ignore[no-untyped-def]
                 failed.append({"project": project.name, "pid": pid, "error": str(e)})
         registry.actions.add("explorer", "shutdown", "done", f"{len(stopped)} instance(s) signalled")
         stop_this_process(delay_s=0.5)
-        return jsonify({"stopped": stopped, "failed": failed, "server": "stopping"})
+        return jsonify({"stopped": stopped, "failed": failed, "refused": refused, "server": "stopping"})
 
     @app.get("/api/projects/<project_id>/status")
     def project_status(project_id: str):  # type: ignore[no-untyped-def]
@@ -855,7 +964,6 @@ def stop_this_process(delay_s: float = 0.5) -> None:
     process, which any caller that is not a real server (a test, an embedded
     use) must be able to stand in for.
     """
-    import os
     import signal
 
     def stop() -> None:
@@ -891,7 +999,7 @@ def _attach(root: str | Path, port: int, host: str) -> bool:
     req = urllib.request.Request(
         f"http://{host}:{port}/api/projects",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", _TOKEN_HEADER: explorer_token()},
         method="POST",
     )
     try:
@@ -941,10 +1049,8 @@ def ensure_explorer(
                 log.warning("Port %d is in use but is not a Codescope explorer; not starting one.", port)
                 return url, False
 
-        import os as _os
-
         registry = ProjectRegistry()
-        registry.register(project_root, _os.getpid())
+        registry.register(project_root, os.getpid())
         server = ExplorerServer(registry, port, host)
         server.start()
         _hosted["server"] = server

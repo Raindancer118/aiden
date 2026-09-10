@@ -102,7 +102,16 @@ What it shows, per project:
 
 It can also run index maintenance (sync, reindex, watch start/stop). Those are
 the only write operations exposed; editing, deletion and shell access stay out
-of the browser on purpose. When you run one, the agent is told with its next
+of the browser on purpose.
+
+Loopback is not treated as a boundary. Any local process can connect to it,
+and a page you visit can point a hostname at 127.0.0.1, so: requests are
+rejected unless the `Host` is a loopback name (DNS rebinding), a foreign
+`Origin` is refused, every state-changing request needs the secret in
+`~/.codescope/token` (mode 0600, handed to the page in its own HTML where a
+cross-origin caller cannot read it), registration is confined to your home
+directory, and a process id registered over the API is verified to be a live
+Codescope process you own before it is ever signalled. When you run one, the agent is told with its next
 tool result — explicitly as a notification it does not have to act on.
 
 The counter in the header opens the list of every project Codescope has run
