@@ -15,12 +15,14 @@ sqlite-vec's L2 distance is monotonic with cosine similarity.
 
 Two properties matter for a local-first index and are enforced here:
 
-*Bounded memory.* :meth:`Embedder.embed_batched` yields vectors in small,
-length-homogeneous batches. ONNX pads every batch to its longest member and
-attention cost grows quadratically with that length, so one long body in a
-256-item batch used to inflate peak RSS into the tens of gigabytes. Sorting by
-length before batching removes almost all of that padding waste, and yielding
-per batch lets callers persist as they go instead of buffering every vector.
+*Bounded memory.* :meth:`Embedder.embed_batched` yields vectors in
+fixed-size batches, longest first, and the batch size comes from a budget on
+``count * longest**2`` rather than an item count. ONNX pads every batch to its
+longest member, attention is quadratic in that length, and ONNX Runtime grows
+its arena per tensor shape without ever returning it -- so the ordering and
+the fixed size are what keep peak memory flat, not the size alone. See
+:meth:`Embedder.embed_batched` for the measurements behind each. Yielding per
+batch also lets callers persist as they go instead of buffering every vector.
 
 *Reused models.* Loading a code embedding model costs seconds and hundreds of
 megabytes, so :func:`get_embedder` / :func:`embedder_from_id` memoize instances
@@ -43,22 +45,20 @@ log = logging.getLogger(__name__)
 DEFAULT_FASTEMBED_MODEL = "jinaai/jina-embeddings-v2-base-code"
 DEFAULT_GEMINI_MODEL = "gemini-embedding-001"
 
-#: Upper bound on documents per forward pass. The *effective* batch is chosen
-#: per batch from the character budget below, so short symbols still go out in
-#: large batches while long ones do not blow up memory.
+#: Upper bound on documents per forward pass. The batch actually used is the
+#: smaller of this and what the cost budget below allows for the corpus.
 DEFAULT_BATCH_SIZE = 128
 
 #: Budget for ``count * longest_length ** 2`` per forward pass, in char^2.
 #:
-#: Transformer attention allocates a ``length x length`` matrix per item, and
-#: ONNX pads every item in a batch to the longest one, so a batch's peak
-#: memory tracks ``count * longest^2`` -- not the item count, and not
-#: ``count * longest``. Budgeting the actual quantity is what keeps peak
-#: memory flat across a run whose batches get progressively longer, while
-#: still letting hundreds of short symbols share one pass.
+#: Transformer attention allocates a ``length x length`` matrix per item and
+#: ONNX pads every item to the longest in the batch, so a batch's peak memory
+#: tracks ``count * longest^2`` -- not the item count, and not
+#: ``count * longest``. This budget therefore sets the peak directly, and
+#: because batches run longest-first it is reached on the very first batch.
 #:
-#: At the default body budget (~1900 chars) this allows ~5 of the longest
-#: symbols per pass, or ~128 short ones.
+#: At the default body budget (~1900 chars) this allows ~5 symbols per pass
+#: and measures at a flat 1.59 GB for a full index of this repository.
 DEFAULT_BATCH_COST = 20_000_000
 
 #: Hard cap on the characters handed to the model. Symbol bodies are already

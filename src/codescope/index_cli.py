@@ -75,7 +75,7 @@ _verbose_option = click.option("-v", "--verbose", is_flag=True, help="Log progre
     default=DEFAULT_BATCH_SIZE,
     show_default=True,
     type=click.IntRange(1, 512),
-    help="Documents per embedding forward pass. Lower it if memory is tight.",
+    help="Upper bound on documents per forward pass. For memory, set CODESCOPE_EMBED_BATCH_COST instead: that budget, not this cap, is what sets the peak.",
 )
 @_json_option
 @_verbose_option
