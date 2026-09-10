@@ -6,11 +6,17 @@ Status of the `main` branch. Changes prior to the next official version change w
   - Embedding models are memoized per process. Every semantic search previously
     reconstructed the ONNX model (~2.7 s and ~0.9 GB on the default code model)
     before it could embed the query.
-  - Embedding runs in small, length-homogeneous batches and persists each batch.
-    ONNX pads a batch to its longest member, so one long body used to inflate the
-    whole run; peak RSS for a full index of this repository dropped from ~20 GB to
-    2.3 GB (measured), and an interrupted run now keeps everything it had written.
-  - New `CODESCOPE_EMBED_MODEL` / `CODESCOPE_EMBED_BATCH` / `CODESCOPE_EMBED_THREADS`.
+  - Embedding runs in bounded, length-homogeneous batches, longest first, and
+    persists each batch. Two separate effects drove the old blow-up: ONNX pads a
+    batch to its longest member and attention is quadratic in that length, so the
+    budget is now on `count x longest^2` rather than on the item count; and ONNX
+    Runtime grows its arena for each new tensor shape without ever returning it,
+    so ascending batches made memory climb for the whole run (measured at 7 GB and
+    still rising). Taking the largest batch first allocates the high-water mark
+    once and every later batch reuses it - measured flat from the first batch on.
+    An interrupted run keeps everything it had written.
+  - New `CODESCOPE_EMBED_MODEL` / `CODESCOPE_EMBED_BATCH_COST` /
+    `CODESCOPE_EMBED_BATCH` / `CODESCOPE_EMBED_THREADS`.
   - New `codescope index build|sync|status|search` CLI, so a first index can run
     outside the MCP server under a memory cap, and resume after being killed.
   - Symbol bodies are indexed in full for BM25/trigram (the previous 2000-character

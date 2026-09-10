@@ -524,3 +524,21 @@ def test_path_glob_prefilter_is_a_superset_of_the_exact_matcher(tmp_path: Path, 
 
     hits = SearchEngine(tmp_path, db_path=db).hybrid_search("validate thing", limit=10, flt=SearchFilter(path_glob=pattern))
     assert bool(hits) is expected, f"path_glob={pattern!r}"
+
+
+def test_batches_run_longest_first() -> None:
+    """ONNX grows its arena per new tensor shape and never returns it.
+
+    Ascending batches therefore make memory climb for the whole run; taking
+    the largest batch first allocates the high-water mark once and every
+    later batch reuses it.
+    """
+    embedder = _RecordingEmbedder()
+    embedder.batch_size = 4
+    embedder.batch_cost = 10_000_000
+    texts = ["z" * n for n in (10, 900, 40, 1500, 70, 300)]
+
+    list(embedder.embed_batched(texts))
+
+    longest_per_batch = [max(len(t) for t in call) for call in embedder.calls]
+    assert longest_per_batch == sorted(longest_per_batch, reverse=True), longest_per_batch
