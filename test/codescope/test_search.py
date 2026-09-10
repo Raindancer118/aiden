@@ -430,19 +430,19 @@ def test_clone_group_reports_its_weakest_pair(tmp_path: Path) -> None:
     assert group.min_similarity >= 0.95  # a true clone pair: every pair holds up
 
 
-def test_batching_budgets_padded_cost_not_item_count() -> None:
-    """A batch costs count x longest item, so that product is what is capped."""
+def test_batching_budgets_quadratic_padded_cost() -> None:
+    """Attention is quadratic in the padded length, so count x longest^2 is capped."""
     embedder = _RecordingEmbedder()
     embedder.batch_size = 64
-    embedder.batch_chars = 1000
+    embedder.batch_cost = 1_000_000
 
     short = ["x" * 10] * 60
     long = ["y" * 900] * 3
     list(embedder.embed_batched(short + long))
 
     for call in embedder.calls:
-        cost = len(call) * max(len(t) for t in call)
-        assert cost <= embedder.batch_chars * 2, (len(call), max(len(t) for t in call))
+        longest = max(len(t) for t in call)
+        assert len(call) * longest**2 <= embedder.batch_cost * 2, (len(call), longest)
     # Short symbols must NOT be throttled down to the long items' batch size.
     assert max(len(call) for call in embedder.calls) > 10
     # ... while the long ones go out in tiny batches.
@@ -453,7 +453,7 @@ def test_batching_budgets_padded_cost_not_item_count() -> None:
 def test_every_text_is_embedded_exactly_once_under_budgeting() -> None:
     embedder = _RecordingEmbedder()
     embedder.batch_size = 8
-    embedder.batch_chars = 500
+    embedder.batch_cost = 250_000
     texts = [f"sym{i}" + "z" * (i * 31 % 400) for i in range(97)]
 
     seen: dict[int, list[float]] = {}
@@ -498,3 +498,29 @@ def test_exclude_tests_recognises_the_usual_conventions(tmp_path: Path, path: st
     filtered = engine.hybrid_search("helper thing", limit=20, flt=SearchFilter(exclude_tests=True))
     assert not any(h.path == path for h in filtered), f"{path} should be recognised as a test file"
     assert any(h.path == "prod.py" for h in filtered)
+
+
+@pytest.mark.parametrize("name", ["latest.py", "contest.py", "protest.py", "attestation.py"])
+def test_exclude_tests_keeps_source_files_that_merely_contain_test(tmp_path: Path, name: str) -> None:
+    """The prefilter is case-sensitive: 'latest.py' is not a test file."""
+    (tmp_path / name).write_text("def helper_thing():\n    return 1\n")
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embedder=HashingEmbedder())
+
+    hits = SearchEngine(tmp_path, db_path=db).hybrid_search("helper thing", limit=10, flt=SearchFilter(exclude_tests=True))
+    assert any(h.path == name for h in hits), f"{name} was wrongly treated as a test file"
+
+
+@pytest.mark.parametrize(
+    ("pattern", "expected"),
+    [("auth.py", True), ("*.py", True), ("*.[jt]s", False), ("src/*", True), ("src/auth.py", True), ("other/*", False)],
+)
+def test_path_glob_prefilter_is_a_superset_of_the_exact_matcher(tmp_path: Path, pattern: str, expected: bool) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "auth.py").write_text("def validate_thing():\n    return 1\n")
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embedder=HashingEmbedder())
+
+    hits = SearchEngine(tmp_path, db_path=db).hybrid_search("validate thing", limit=10, flt=SearchFilter(path_glob=pattern))
+    assert bool(hits) is expected, f"path_glob={pattern!r}"

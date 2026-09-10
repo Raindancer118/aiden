@@ -89,3 +89,15 @@ def test_context_tool_is_registered() -> None:
     from serena.tools import ToolRegistry
 
     assert "get_code_context" in ToolRegistry().get_tool_names()
+
+
+def test_truncated_is_not_set_for_a_body_that_merely_ends_in_a_newline(tmp_path: Path) -> None:
+    """A false 'truncated' flag sends the agent on a pointless second read."""
+    (tmp_path / "a.py").write_text("def short():\n    return 1\n")
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embedder=HashingEmbedder())
+
+    context = ContextEngine(tmp_path, db_path=db).build("short", body_lines=80)
+    focus = next(s for s in context.symbols if s.name == "short")
+    assert focus.truncated is False
+    assert "return 1" in focus.code

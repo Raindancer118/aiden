@@ -48,11 +48,18 @@ DEFAULT_GEMINI_MODEL = "gemini-embedding-001"
 #: large batches while long ones do not blow up memory.
 DEFAULT_BATCH_SIZE = 128
 
-#: Characters per forward pass. This, not the item count, is what tracks cost:
-#: ONNX pads every item to the longest in the batch, so a batch costs roughly
-#: ``count * longest_length``. Budgeting that directly keeps memory flat
-#: without throttling batches of short symbols to the worst case.
-DEFAULT_BATCH_CHARS = 60_000
+#: Budget for ``count * longest_length ** 2`` per forward pass, in char^2.
+#:
+#: Transformer attention allocates a ``length x length`` matrix per item, and
+#: ONNX pads every item in a batch to the longest one, so a batch's peak
+#: memory tracks ``count * longest^2`` -- not the item count, and not
+#: ``count * longest``. Budgeting the actual quantity is what keeps peak
+#: memory flat across a run whose batches get progressively longer, while
+#: still letting hundreds of short symbols share one pass.
+#:
+#: At the default body budget (~1900 chars) this allows ~16 of the longest
+#: symbols per pass, or ~128 short ones.
+DEFAULT_BATCH_COST = 60_000_000
 
 #: Hard cap on the characters handed to the model. Symbol bodies are already
 #: truncated at parse time (``parser._MAX_BODY_CHARS``); this is the backstop
@@ -68,7 +75,7 @@ DEFAULT_EMBED_BODY_CHARS = 1800
 
 _ENV_MODEL = "CODESCOPE_EMBED_MODEL"
 _ENV_BATCH = "CODESCOPE_EMBED_BATCH"
-_ENV_BATCH_CHARS = "CODESCOPE_EMBED_BATCH_CHARS"
+_ENV_BATCH_COST = "CODESCOPE_EMBED_BATCH_COST"
 _ENV_THREADS = "CODESCOPE_EMBED_THREADS"
 
 _CACHE: dict[str, "Embedder"] = {}
@@ -134,8 +141,8 @@ class Embedder(ABC):
     dim: int
     #: Hard cap on documents per forward pass.
     batch_size: int = DEFAULT_BATCH_SIZE
-    #: Cap on ``count * longest_length`` per forward pass.
-    batch_chars: int = DEFAULT_BATCH_CHARS
+    #: Cap on ``count * longest_length ** 2`` per forward pass.
+    batch_cost: int = DEFAULT_BATCH_COST
     #: Characters per document handed to the backend.
     max_chars: int = DEFAULT_MAX_CHARS
 
@@ -165,15 +172,16 @@ class Embedder(ABC):
             return
         order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
         max_items = max(1, self.batch_size)
-        budget = max(1, self.batch_chars)
+        budget = max(1, self.batch_cost)
 
         current: list[int] = []
         longest = 0
         for index in order:
             length = max(1, len(texts[index]))
             # Cost of adding this item: the batch is padded to its longest
-            # member, so the projected cost is count * longest.
-            projected = max(longest, length) * (len(current) + 1)
+            # member and attention is quadratic in that length, so the
+            # projected cost is count * longest^2.
+            projected = max(longest, length) ** 2 * (len(current) + 1)
             if current and (len(current) >= max_items or projected > budget):
                 yield self._embed_indices(texts, current)
                 current, longest = [], 0
@@ -227,7 +235,7 @@ class FastEmbedEmbedder(Embedder):
         from fastembed import TextEmbedding  # lazy: only when selected
 
         self.batch_size = batch_size or _env_int(_ENV_BATCH, DEFAULT_BATCH_SIZE) or DEFAULT_BATCH_SIZE
-        self.batch_chars = _env_int(_ENV_BATCH_CHARS, DEFAULT_BATCH_CHARS) or DEFAULT_BATCH_CHARS
+        self.batch_cost = _env_int(_ENV_BATCH_COST, DEFAULT_BATCH_COST) or DEFAULT_BATCH_COST
         self.max_chars = max_chars if max_chars is not None else DEFAULT_MAX_CHARS
         threads = threads if threads is not None else _env_int(_ENV_THREADS, None)
         self._model = TextEmbedding(model_name=model_name, threads=threads)

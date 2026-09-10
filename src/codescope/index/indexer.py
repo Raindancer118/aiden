@@ -483,6 +483,9 @@ class Indexer:
         dirty = self._dirty_file_count()
         if dirty:
             advice.append(f"{dirty} file(s) changed in git since the last sync. Run sync_index for current results.")
+        behind = self._indexed_head_moved()
+        if behind:
+            advice.append("The index was built at a different commit than the current HEAD. Run sync_index to catch up.")
 
         return {
             "indexed": True,
@@ -497,9 +500,34 @@ class Indexer:
             "semantic_search_ready": semantic_ready,
             "clone_detection_ready": semantic_ready,
             "uncommitted_changes": dirty,
+            "head_moved_since_index": behind,
             "languages": stats.languages,
             "advice": advice,
         }
+
+    def _indexed_head_moved(self) -> bool | None:
+        """Whether HEAD moved since the index recorded it.
+
+        A clean working tree says nothing about freshness: committing fifty
+        files and switching branch leaves the tree clean and the index stale.
+        None outside a git repository, or before the first git-scoped sync.
+        """
+        from codescope.index.incremental import _GIT_HEAD_META_KEY, _git_head
+
+        try:
+            current = _git_head(self.root)
+        except Exception:  # pragma: no cover - defensive
+            return None
+        if current is None:
+            return None
+        store = IndexStore(self.db_path)
+        try:
+            recorded = store.get_meta(_GIT_HEAD_META_KEY)
+        finally:
+            store.close()
+        if recorded is None:
+            return None
+        return recorded != current
 
     def _dirty_file_count(self) -> int | None:
         """Source files git reports as changed; None outside a git repository."""

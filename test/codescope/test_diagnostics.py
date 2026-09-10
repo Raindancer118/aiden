@@ -93,3 +93,12 @@ def test_diagnostics_tool_is_registered() -> None:
     from serena.tools import ToolRegistry
 
     assert "get_project_diagnostics" in ToolRegistry().get_tool_names()
+
+
+def test_invalid_severity_is_rejected_not_reported_as_a_clean_project() -> None:
+    """Every file failing must not read as 'no problems found'."""
+    from codescope.tools.diagnostics_tools import GetProjectDiagnosticsTool
+
+    tool = object.__new__(GetProjectDiagnosticsTool)
+    with pytest.raises(ValueError, match="min_severity"):
+        GetProjectDiagnosticsTool.apply(tool, min_severity=9)

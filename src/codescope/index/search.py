@@ -104,28 +104,27 @@ class SearchFilter:
         return bool(self.path_glob or self.lang or self.kind or self.exclude_tests)
 
 
-def _glob_to_like(pattern: str) -> str:
-    """Translate a path glob into a SQL LIKE pattern (a superset of it).
+def _glob_clause(pattern: str) -> tuple[str, list[str]]:
+    """SQL prefilter for a path glob, using ``GLOB`` rather than ``LIKE``.
 
-    LIKE cannot express ``*`` vs ``**`` or character classes, so this is only
-    a cheap SQL prefilter; :func:`_matches_glob` applies the exact semantics.
+    ``LIKE`` is case-insensitive in SQLite and has no character classes, which
+    made it both too broad and too narrow: ``*Test.*`` also excluded
+    ``latest.py`` and ``contest.ts``, while ``*.[jt]s`` and bare basenames
+    matched nothing at all. ``GLOB`` is case-sensitive and shares its syntax
+    with the exact matcher below.
+
+    A pattern without a separator also matches by basename, mirroring
+    :func:`_matches_glob`, so this stays a superset of it.
     """
-    out = []
-    for ch in pattern:
-        if ch in "*?":
-            out.append("%" if ch == "*" else "_")
-        elif ch in "%_\\":
-            out.append("\\" + ch)
-        else:
-            out.append(ch)
-    return "".join(out).replace("%%", "%")
+    if "/" in pattern:
+        return "s.path GLOB ?", [pattern]
+    return "(s.path GLOB ? OR s.path GLOB ?)", [pattern, f"*/{pattern}"]
 
 
 def _matches_glob(path: str, pattern: str) -> bool:
-    """Glob match that treats ``**`` as "any depth" and ``*`` as one segment."""
+    """Glob match that also matches a separator-free pattern by basename."""
     if fnmatch.fnmatchcase(path, pattern):
         return True
-    # A bare pattern without a separator should also match by basename.
     return "/" not in pattern and fnmatch.fnmatchcase(path.rsplit("/", 1)[-1], pattern)
 
 
@@ -142,11 +141,14 @@ def _filter_sql(flt: "SearchFilter | None") -> tuple[str, list[object]]:
         clauses.append("s.kind = ?")
         params.append(flt.kind)
     if flt.path_glob:
-        clauses.append("s.path LIKE ? ESCAPE '\\'")
-        params.append(_glob_to_like(flt.path_glob))
+        clause, values = _glob_clause(flt.path_glob)
+        clauses.append(clause)
+        params.extend(values)
     if flt.exclude_tests:
-        clauses.extend(["s.path NOT LIKE ? ESCAPE '\\'"] * len(_TEST_PATH_PATTERNS))
-        params.extend(_glob_to_like(p) for p in _TEST_PATH_PATTERNS)
+        for pattern in _TEST_PATH_PATTERNS:
+            clause, values = _glob_clause(pattern)
+            clauses.append(f"NOT {clause}")
+            params.extend(values)
     return (" AND " + " AND ".join(clauses)) if clauses else "", params
 
 
@@ -305,14 +307,17 @@ class SearchEngine:
         if not tokens:
             return []
         where, params = _filter_sql(flt)
-        name_clause = " OR ".join(["s.name = ?"] * len(tokens) + ["s.name LIKE ?"] * len(tokens))
+        # ESCAPE matters: query tokens may contain '_', which LIKE would
+        # otherwise treat as a single-character wildcard ("get_user" matching
+        # "getXuserData") and rank at the highest fusion weight.
+        name_clause = " OR ".join(["s.name = ?"] * len(tokens) + ["s.name LIKE ? ESCAPE '\\'"] * len(tokens))
         ordered = sorted(tokens)
         rows = store.conn.execute(
             "SELECT s.id FROM symbols AS s JOIN files AS fi ON fi.path = s.path "
             f"WHERE ({name_clause}){where} "
             # exact names first, then shortest (least diluted) match
             "ORDER BY (s.name IN (" + ",".join("?" * len(ordered)) + ")) DESC, LENGTH(s.name) LIMIT ?",
-            (*ordered, *[f"{t}%" for t in ordered], *params, *ordered, k),
+            (*ordered, *[t.replace("\\", "\\\\").replace("_", "\\_").replace("%", "\\%") + "%" for t in ordered], *params, *ordered, k),
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -463,9 +468,13 @@ class SearchEngine:
             fused = self._rrf(rankings, weights)
             if not fused:
                 return []
-            top = sorted(fused.items(), key=lambda kv: kv[1][0], reverse=True)[:limit]
-            hits = self._fetch_symbols(store, [sid for sid, _ in top], preview_lines)
-            hits = self._apply_glob(hits, flt)
+            ranked = sorted(fused.items(), key=lambda kv: kv[1][0], reverse=True)
+            # Fetch a slice wider than the limit so the exact glob (which the
+            # SQL prefilter deliberately over-approximates) trims candidates
+            # rather than the final answer.
+            candidates = ranked[: limit * 3] if flt is not None and flt.path_glob else ranked[:limit]
+            hits = self._apply_glob(self._fetch_symbols(store, [sid for sid, _ in candidates], preview_lines), flt)
+            top = [entry for entry in candidates if entry[0] in hits][:limit]
         result = []
         for sid, (score, sources) in top:
             hit = hits.get(sid)

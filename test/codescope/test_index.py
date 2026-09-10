@@ -311,3 +311,30 @@ def test_health_reports_an_incomplete_vector_backfill(project: Path) -> None:
     assert health["vectors"] == 0
     assert health["symbols_missing_vectors"] == health["symbols"] > 0
     assert any("No vectors indexed" in a for a in health["advice"])
+
+
+def test_health_notices_a_moved_head_on_a_clean_tree(tmp_path: Path) -> None:
+    """A clean working tree says nothing about freshness."""
+    pytest.importorskip("pygit2")
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "a.py").write_text("def one():\n    return 1\n")
+    for args in (["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@e", "commit", "-qm", "one"]):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True)
+
+    db = _db(tmp_path)
+    indexer = Indexer(tmp_path, db_path=db)
+    from codescope.index.incremental import sync_incremental
+
+    sync_incremental(indexer, embeddings=False)
+    assert indexer.health()["head_moved_since_index"] is False
+
+    (tmp_path / "b.py").write_text("def two():\n    return 2\n")
+    for args in (["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@e", "commit", "-qm", "two"]):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True)
+
+    health = Indexer(tmp_path, db_path=db).health()
+    assert health["uncommitted_changes"] == 0
+    assert health["head_moved_since_index"] is True
+    assert any("HEAD" in a for a in health["advice"])

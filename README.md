@@ -78,7 +78,8 @@ Tuning (all optional):
 | Variable | Meaning |
 |----------|---------|
 | `CODESCOPE_EMBED_MODEL` | fastembed model id. The default is code-aware and 768-dimensional; a smaller general model trades retrieval quality for a much faster, lighter index. |
-| `CODESCOPE_EMBED_BATCH` | documents per forward pass (default 32). Lower it if memory is tight. |
+| `CODESCOPE_EMBED_BATCH_COST` | memory budget per forward pass, as `item count x longest item^2` in char² (default 60000000). This is the real dial: ONNX pads every item to the longest one in the batch and attention is quadratic in that length. Halve it to roughly halve peak memory, at some throughput. |
+| `CODESCOPE_EMBED_BATCH` | hard cap on documents per forward pass (default 128); the character budget above usually binds first. |
 | `CODESCOPE_EMBED_THREADS` | ONNX thread count. Unset means "all cores". |
 
 ## Use with Claude Code

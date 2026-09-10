@@ -340,6 +340,16 @@ class IndexStore:
     # -- mutation ---------------------------------------------------------
 
     def delete_file(self, path: str) -> None:
+        """Remove every row belonging to ``path``, as one unit.
+
+        Six separate DELETEs in autocommit mode could be interrupted between
+        the FTS/vector deletes and the symbol delete, leaving symbols with no
+        searchable text. Joins an outer transaction when one is open.
+        """
+        with self.transaction():
+            self._delete_file_rows(path)
+
+    def _delete_file_rows(self, path: str) -> None:
         cur = self.conn.cursor()
         ids = [r[0] for r in cur.execute("SELECT id FROM symbols WHERE path=?", (path,))]
         if ids:
@@ -371,7 +381,7 @@ class IndexStore:
         cur = self.conn.cursor()
         cur.execute("SAVEPOINT codescope_upsert_file")
         try:
-            self.delete_file(path)
+            self._delete_file_rows(path)
             cur.execute(
                 "INSERT INTO files(path, lang, hash, mtime, size, indexed_at) VALUES(?,?,?,?,?,?)",
                 (path, lang, file_hash, mtime, size, indexed_at),

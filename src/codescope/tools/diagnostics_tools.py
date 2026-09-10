@@ -47,6 +47,11 @@ class GetProjectDiagnosticsTool(Tool, ToolMarkerSymbolicRead):
             (line, severity, source, code, message), the files that could not
             be checked, and whether the sweep was truncated.
         """
+        if min_severity not in (1, 2, 3, 4):
+            # Otherwise the language server rejects every request and the
+            # per-file error handling reports "all files skipped, 0 problems",
+            # which reads like a clean project.
+            raise ValueError("min_severity must be 1 (error), 2 (warning), 3 (information) or 4 (hint)")
         root = Path(self.get_project_root())
         files = files_to_inspect(root, scope, path_glob)
         retriever = self.create_language_server_symbol_retriever()

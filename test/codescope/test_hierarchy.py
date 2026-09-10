@@ -114,3 +114,40 @@ def test_hierarchy_tools_are_registered() -> None:
     names = ToolRegistry().get_tool_names()
     assert "get_type_hierarchy" in names
     assert "get_call_hierarchy" in names
+
+
+def test_type_hierarchy_tool_returns_one_shape_on_both_paths(tmp_path, monkeypatch) -> None:
+    """LSP and index answers must be parseable by the same caller."""
+    import json
+
+    from codescope.index.embed import HashingEmbedder
+    from codescope.index.indexer import Indexer
+    from codescope.tools.hierarchy_tools import GetTypeHierarchyTool
+
+    (tmp_path / "models.py").write_text("class BaseModel:\n    pass\n\n\nclass User(BaseModel):\n    pass\n")
+    Indexer(tmp_path).reindex(embedder=HashingEmbedder())
+
+    tool = object.__new__(GetTypeHierarchyTool)
+    tool.get_project_root = lambda: str(tmp_path)  # type: ignore[method-assign]
+    tool._to_json = lambda payload: json.dumps(payload, default=str)  # type: ignore[method-assign]
+    tool._locate = lambda name_path, relative_path: ("models.py", 4, 6)  # type: ignore[method-assign]
+
+    class _NoTypeHierarchy:
+        @staticmethod
+        def request_type_hierarchy(*_args, **_kwargs):
+            return {"item": None, "supertypes": [], "subtypes": [], "supported": False}
+
+    tool._language_server = lambda _rel: _NoTypeHierarchy()  # type: ignore[method-assign]
+
+    result = json.loads(GetTypeHierarchyTool.apply(tool, "User", "models.py"))
+    assert result["resolved_by"] == "index"
+    assert result["item"]["name"] == "User"
+    # Same keys as the LSP path: relativePath/line, not path/start_line.
+    assert set(result["supertypes"][0]) == {"name", "kind", "relativePath", "line"}
+    assert result["supertypes"][0]["name"] == "BaseModel"
+    assert "does not implement type hierarchy" in result["note"]
+
+    # An unknown type keeps the index's own explanation instead of losing it.
+    unknown = json.loads(GetTypeHierarchyTool.apply(tool, "Nope", "models.py"))
+    assert unknown["item"] is None
+    assert "No indexed type" in unknown["note"]

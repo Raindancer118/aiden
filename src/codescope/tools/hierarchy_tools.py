@@ -13,10 +13,15 @@ index graph when you want a fast structural overview of a whole subtree.
 
 from __future__ import annotations
 
-from dataclasses import asdict
-
-from codescope.index.graph import GraphEngine
+from codescope.index.graph import GraphEngine, SymbolRef
 from serena.tools import Tool, ToolMarkerSymbolicRead
+
+
+def _as_item(ref: SymbolRef | None) -> dict | None:
+    """Render an indexed symbol in the same shape the LSP path returns."""
+    if ref is None:
+        return None
+    return {"name": ref.name, "kind": ref.kind, "relativePath": ref.path, "line": ref.start_line}
 
 
 class _HierarchyToolBase(Tool):
@@ -63,24 +68,37 @@ class GetTypeHierarchyTool(_HierarchyToolBase, ToolMarkerSymbolicRead):
         rel, line, column = self._locate(name_path, relative_path)
         result = self._language_server(rel).request_type_hierarchy(rel, line, column, direction=direction)
         if result.get("supported") and result.get("item") is not None:
-            result["resolved_by"] = "lsp"
-            return self._to_json(result)
+            return self._to_json(
+                {
+                    "item": result["item"],
+                    "supertypes": result["supertypes"],
+                    "subtypes": result["subtypes"],
+                    "resolved_by": "lsp",
+                    "note": "",
+                }
+            )
 
         # Several widely used servers (pyright among them) implement call
         # hierarchy but not type hierarchy. Rather than answering "not
         # supported", fall back to the index, which reads base types out of
-        # the stored declaration lines.
-        fallback = asdict(GraphEngine(self.get_project_root()).type_hierarchy(name_path.rsplit("/", 1)[-1]))
-        if direction == "supertypes":
-            fallback["subtypes"] = []
-        elif direction == "subtypes":
-            fallback["supertypes"] = []
-        fallback["note"] = (
-            "The language server for this file does not implement type hierarchy; "
-            "these edges were read from indexed declarations and are not type-resolved. "
-            "Confirm important ones with find_implementations."
-        ).strip()
-        return self._to_json(fallback)
+        # the stored declaration lines -- normalized into the same shape, so
+        # a caller never has to branch on which path answered.
+        hierarchy = GraphEngine(self.get_project_root()).type_hierarchy(name_path.rsplit("/", 1)[-1])
+        notes = [
+            "The language server for this file does not implement type hierarchy; these edges were read from "
+            "indexed declarations and are not type-resolved. Confirm important ones with find_implementations."
+        ]
+        if hierarchy.note:
+            notes.insert(0, hierarchy.note)
+        return self._to_json(
+            {
+                "item": _as_item(hierarchy.item),
+                "supertypes": [_as_item(s) for s in hierarchy.supertypes] if direction != "subtypes" else [],
+                "subtypes": [_as_item(s) for s in hierarchy.subtypes] if direction != "supertypes" else [],
+                "resolved_by": "index",
+                "note": " ".join(notes),
+            }
+        )
 
 
 class GetCallHierarchyTool(_HierarchyToolBase, ToolMarkerSymbolicRead):

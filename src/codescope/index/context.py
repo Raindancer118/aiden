@@ -130,6 +130,9 @@ class ContextEngine:
             for hit in hits:
                 body = bodies.get(hit.symbol_id, "")
                 folded = _fold(body, body_lines)
+                # _fold rejoins lines, so a body with a trailing newline is
+                # never byte-identical; compare what was actually dropped.
+                truncated = len(body.splitlines()) > body_lines > 0
                 referencing = self.graph.dependents_in(store, hit.name)
                 callees = self.graph.dependencies_in(store, hit.name, path=hit.path, start_line=hit.start_line)
                 callers = self._related(referencing, ambiguous, related, tests=False)
@@ -145,7 +148,7 @@ class ContextEngine:
                         lang=hit.lang,
                         signature=hit.signature,
                         code=folded,
-                        truncated=folded != body,
+                        truncated=truncated,
                         called_by=callers,
                         calls=self._related(callees, ambiguous, related, tests=False),
                         tests=tests,

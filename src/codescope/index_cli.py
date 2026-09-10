@@ -85,9 +85,15 @@ def build(project: Path, force: bool, no_embeddings: bool, embedder: str, batch_
     indexer = Indexer(project, embedder_name=embedder)
     resolved = None
     if not no_embeddings:
-        resolved = get_embedder(embedder)
-        resolved.batch_size = batch_size
-        click.echo(f"Embedding with {resolved.id} (batch size {batch_size})", err=True)
+        # Resolve through get_embedder so the batch size reaches the backend,
+        # but only hand the instance to reindex() when the user *named* a
+        # backend. Passing an auto-resolved one would mark the choice as
+        # explicit and let a silently degraded hashing fallback rebuild a
+        # real semantic index (see Indexer._update_embeddings).
+        candidate = get_embedder(embedder, batch_size=batch_size) if embedder == "fastembed" else get_embedder(embedder)
+        click.echo(f"Embedding with {candidate.id} (batch size {candidate.batch_size})", err=True)
+        if embedder.lower() not in ("", "auto"):
+            resolved = candidate
 
     started = time.time()
     report = indexer.reindex(force=force, embeddings=not no_embeddings, embedder=resolved)
@@ -150,7 +156,10 @@ def doctor(project: Path, as_json: bool) -> None:
         _report(health, True)
     else:
         _report({k: v for k, v in health.items() if k != "languages"}, False)
-    sys.exit(1 if health.get("advice") else 0)
+    # Exit non-zero only for states that actually block a query, so `doctor`
+    # is usable as a CI gate; a merely dirty working tree is normal.
+    blocking = not health.get("indexed") or not health.get("semantic_search_ready") or health.get("symbols_missing_vectors")
+    sys.exit(1 if blocking else 0)
 
 
 @index_group.command("search")

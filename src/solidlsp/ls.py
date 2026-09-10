@@ -2292,6 +2292,19 @@ class SolidLanguageServer(ABC):
             return None
         return ls_types.Hover(**response)  # type: ignore
 
+    def _supports_type_hierarchy(self) -> bool:
+        """Whether ``textDocument/prepareTypeHierarchy`` is safe to send.
+
+        Like :meth:`_supports_pull_diagnostics`, subclasses should return
+        ``False`` for servers that do not merely answer "method not found"
+        but terminate on an unknown method.
+        """
+        return True
+
+    def _supports_call_hierarchy(self) -> bool:
+        """Whether ``textDocument/prepareCallHierarchy`` is safe to send."""
+        return True
+
     @staticmethod
     def _is_unsupported_method(exc: Exception) -> bool:
         """Whether the server answered "I do not implement that" (JSON-RPC -32601).
@@ -2301,6 +2314,9 @@ class SolidLanguageServer(ABC):
         hierarchy. A missing capability is an answer, not a failure, so the
         caller reports "unsupported" instead of raising at the agent.
         """
+        if isinstance(exc, SolidLSPException) and exc.is_language_server_terminated():
+            # The server died rather than declining: that is a real failure.
+            return False
         text = f"{exc} {getattr(exc, 'cause', '')}"
         return "-32601" in text or "Unhandled method" in text or "MethodNotFound" in text
 
@@ -2316,6 +2332,8 @@ class SolidLanguageServer(ABC):
             when the language server does not implement type hierarchy.
         """
         empty: dict[str, Any] = {"item": None, "supertypes": [], "subtypes": [], "supported": True}
+        if not self._supports_type_hierarchy():
+            return {**empty, "supported": False}
         with self.open_file(relative_file_path):
             try:
                 prepared = self.server.send.prepare_type_hierarchy(
@@ -2351,6 +2369,8 @@ class SolidLanguageServer(ABC):
         :param direction: ``incoming`` (callers) or ``outgoing`` (callees).
         :return: ``{name, kind, relativePath, line, callSites}`` per entry.
         """
+        if not self._supports_call_hierarchy():
+            return []
         with self.open_file(relative_file_path):
             try:
                 prepared = self.server.send.prepare_call_hierarchy(
@@ -2394,13 +2414,14 @@ class SolidLanguageServer(ABC):
         }
 
     def _uri_to_relative_path(self, uri: str) -> str:
-        from urllib.parse import unquote, urlparse
+        """Project-relative path for a document URI.
 
-        path = unquote(urlparse(uri).path)
-        try:
-            return str(pathlib.PurePath(path).relative_to(self.repository_root_path))
-        except ValueError:
-            return path
+        Uses ``PathUtils`` like every other call site in this file: a naive
+        ``urlparse().path`` yields ``/C:/Users/...`` on Windows, which then
+        fails to resolve against the repository root.
+        """
+        absolute = PathUtils.uri_to_path(uri)
+        return PathUtils.get_relative_path(absolute, self.repository_root_path) or absolute
 
     def request_signature_help(self, relative_file_path: str, line: int, column: int) -> ls_types.SignatureHelp | None:
         """
