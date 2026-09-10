@@ -4,7 +4,7 @@ requires = ["hatchling"]
 
 [project]
 name = "volantic-codescope"
-version = "0.3.1"
+version = "0.3.2"
 description = "Volantic Codescope - an all-in-one codebase-intelligence MCP: LSP-accurate navigation & editing (via Serena) plus a persistent hybrid index (tree-sitter + SQLite FTS5/BM25 + vectors + trigram), code graphs, and dev-ops (test runner, scaffolding, GitHub)."
 authors = [{ name = "Tom Stieh (Raindancer118)", email = "tom560stieh@gmail.com" }]
 readme = "README.md"
