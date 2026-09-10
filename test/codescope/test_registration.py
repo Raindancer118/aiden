@@ -70,3 +70,32 @@ def test_codescope_cli_does_not_expose_local_memory_commands() -> None:
     )
 
     assert "memories" not in result.stdout
+
+
+def test_index_tool_bodies_execute(tmp_path) -> None:
+    """Run the index tools' apply() bodies for real.
+
+    Registration tests only prove a tool exists; they do not execute a single
+    line of its body, so a name that is only resolved at call time (a dropped
+    import, say) stays invisible until an agent hits it.
+    """
+    import json
+
+    from codescope.tools.index_tools import IndexStatusTool, ReindexTool
+
+    (tmp_path / "app.py").write_text("def greet(name):\n    return name.upper()\n")
+
+    def _stub(cls):
+        tool = object.__new__(cls)
+        tool.get_project_root = lambda: str(tmp_path)  # type: ignore[method-assign]
+        tool._to_json = lambda payload: json.dumps(payload, default=str)  # type: ignore[method-assign]
+        return tool
+
+    report = json.loads(ReindexTool.apply(_stub(ReindexTool), embeddings=False))
+    assert report["indexed"] == 1
+    assert report["totals"]["symbols"] >= 1
+
+    health = json.loads(IndexStatusTool.apply(_stub(IndexStatusTool)))
+    assert health["indexed"] is True
+    assert health["symbols"] >= 1
+    assert "advice" in health

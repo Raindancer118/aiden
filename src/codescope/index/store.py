@@ -427,6 +427,12 @@ class IndexStore:
 
     # -- stats ------------------------------------------------------------
 
+    def symbols_missing_vectors(self) -> int:
+        """How many symbols have no vector (0 when embeddings are complete)."""
+        if not self._vec_table_exists():
+            return self.conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+        return self.conn.execute("SELECT COUNT(*) FROM symbols WHERE id NOT IN (SELECT sid FROM chunks_vec)").fetchone()[0]
+
     def stats(self) -> IndexStats:
         c = self.conn
         n_files = c.execute("SELECT COUNT(*) FROM files").fetchone()[0]

@@ -140,6 +140,19 @@ def status(project: Path, as_json: bool) -> None:
     _report(stats, as_json)
 
 
+@index_group.command("doctor")
+@_project_option
+@_json_option
+def doctor(project: Path, as_json: bool) -> None:
+    """Say what the index can answer right now, and what to do about the rest."""
+    health = Indexer(project).health()
+    if as_json:
+        _report(health, True)
+    else:
+        _report({k: v for k, v in health.items() if k != "languages"}, False)
+    sys.exit(1 if health.get("advice") else 0)
+
+
 @index_group.command("search")
 @_project_option
 @click.argument("query")

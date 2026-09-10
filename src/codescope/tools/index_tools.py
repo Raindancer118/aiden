@@ -48,17 +48,26 @@ class ReindexTool(Tool):
 
 class IndexStatusTool(Tool):
     """
-    Report the status of the Codescope index for the active project: number of
-    indexed files, extracted symbols and references, and a per-language
-    breakdown. If the index has not been built yet, all counts are zero.
+    Report what the Codescope index can currently answer, and what it cannot.
+
+    Beyond the counts (files, symbols, references, vectors, languages), this
+    states whether semantic search and clone detection are actually usable:
+    an index built without embeddings, or one that fell back to hash vectors
+    because the embedding backend failed to load, still answers every query -
+    lexically. Check this when results look thin, before concluding that
+    something is not in the codebase.
+
+    ``advice`` lists the concrete next step for each problem found (build the
+    index, finish the vector backfill, sync after git changes).
     """
 
     def apply(self) -> str:
         """
-        Return a JSON summary of the current index contents.
+        Return a JSON health report for the current index.
 
-        :return: JSON with total indexed files, symbols, references, and a
-            per-language file-count breakdown.
+        :return: JSON with the index contents, whether semantic search and
+            clone detection are ready, how many symbols still lack a vector,
+            how many source files changed in git since the last sync, and
+            what to do about each.
         """
-        indexer = Indexer(self.get_project_root())
-        return self._to_json(asdict(indexer.status()))
+        return self._to_json(Indexer(self.get_project_root()).health())

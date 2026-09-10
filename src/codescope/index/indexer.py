@@ -440,3 +440,76 @@ class Indexer:
             return store.stats()
         finally:
             store.close()
+
+    def health(self) -> dict:
+        """What the index can and cannot answer right now.
+
+        An agent that cannot tell "no results" from "not indexed yet" or
+        "semantic search silently degraded to hash vectors" will draw wrong
+        conclusions from an empty answer, so those states are reported
+        explicitly rather than left to be inferred.
+        """
+        exists = self.db_path.exists()
+        advice: list[str] = []
+        if not exists:
+            return {
+                "indexed": False,
+                "db_path": str(self.db_path),
+                "advice": ["No index yet. Run reindex (or `codescope index build`) before searching."],
+            }
+
+        store = IndexStore(self.db_path)
+        try:
+            stats = store.stats()
+            missing = store.symbols_missing_vectors()
+            vec_enabled = store.vec_enabled
+        finally:
+            store.close()
+
+        embedder = stats.embedder or ""
+        semantic_ready = bool(stats.vectors) and not embedder.startswith("hashing-")
+        if not vec_enabled:
+            advice.append("sqlite-vec is unavailable, so this index is lexical only; semantic search will fall back to BM25.")
+        elif not stats.vectors:
+            advice.append("No vectors indexed. Run reindex with embeddings enabled for semantic search and clone detection.")
+        elif embedder.startswith("hashing-"):
+            advice.append(
+                "Vectors come from the hashing fallback, not a semantic model: matching is lexical. "
+                "Install/repair the embedding backend and reindex with an explicit embedder to upgrade."
+            )
+        if missing:
+            advice.append(f"{missing} symbol(s) have no vector yet. Re-run reindex to finish the backfill (it resumes).")
+
+        dirty = self._dirty_file_count()
+        if dirty:
+            advice.append(f"{dirty} file(s) changed in git since the last sync. Run sync_index for current results.")
+
+        return {
+            "indexed": True,
+            "db_path": str(self.db_path),
+            "db_size_bytes": self.db_path.stat().st_size,
+            "files": stats.files,
+            "symbols": stats.symbols,
+            "refs": stats.refs,
+            "vectors": stats.vectors,
+            "symbols_missing_vectors": missing,
+            "embedder": stats.embedder,
+            "semantic_search_ready": semantic_ready,
+            "clone_detection_ready": semantic_ready,
+            "uncommitted_changes": dirty,
+            "languages": stats.languages,
+            "advice": advice,
+        }
+
+    def _dirty_file_count(self) -> int | None:
+        """Source files git reports as changed; None outside a git repository."""
+        from codescope.index.incremental import git_changes
+
+        try:
+            changes = git_changes(self.root)
+        except Exception:  # pragma: no cover - defensive
+            return None
+        if changes is None:
+            return None
+        changed, deleted = changes
+        return len([p for p in (changed | deleted) if spec_for_path(p) is not None])

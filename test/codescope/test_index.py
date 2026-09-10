@@ -281,3 +281,33 @@ def test_failed_vector_swap_rolls_back_to_the_previous_vectors(project: Path) ->
     with IndexStore(db) as store:
         assert store.stats().vectors == before
         assert store.get_meta("embedder_id") == "hashing-16"
+
+
+def test_health_reports_a_missing_index_instead_of_zeroes(tmp_path: Path) -> None:
+    health = Indexer(tmp_path, db_path=_db(tmp_path)).health()
+    assert health["indexed"] is False
+    assert any("reindex" in a for a in health["advice"])
+
+
+def test_health_flags_the_lexical_fallback_as_not_semantic(project: Path) -> None:
+    """A hash-vector index answers every query - lexically. Say so."""
+    db = _db(project)
+    Indexer(project, db_path=db).reindex(embedder=HashingEmbedder())
+
+    health = Indexer(project, db_path=db).health()
+    assert health["indexed"] is True
+    assert health["vectors"] > 0
+    assert health["symbols_missing_vectors"] == 0
+    assert health["semantic_search_ready"] is False
+    assert health["clone_detection_ready"] is False
+    assert any("hashing fallback" in a for a in health["advice"])
+
+
+def test_health_reports_an_incomplete_vector_backfill(project: Path) -> None:
+    db = _db(project)
+    Indexer(project, db_path=db).reindex(embeddings=False)
+
+    health = Indexer(project, db_path=db).health()
+    assert health["vectors"] == 0
+    assert health["symbols_missing_vectors"] == health["symbols"] > 0
+    assert any("No vectors indexed" in a for a in health["advice"])
