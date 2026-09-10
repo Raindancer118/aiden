@@ -208,16 +208,14 @@ class IndexStore:
         return existing_dim is not None and (int(existing_dim) != dim or existing_id != embedder_id)
 
     def rebuild_vec_table(self, dim: int, embedder_id: str, rows: list[tuple[int, list[float], str, str]]) -> None:
-        """Replace the vector table with a freshly embedded set.
+        """Replace the vector table with a freshly embedded set, atomically.
 
-        Callers must compute ``rows`` (i.e. run the embedder over every
-        symbol) *before* calling this method: that embedding step is the part
-        that can fail (backend errors, network, etc.), and once it has
-        succeeded, replacing the table is pure, fast, local SQL. This ordering
-        is what keeps a failing embedder from destroying the previous, working
-        vector table -- unlike a naive drop-then-embed sequence, where the
-        auto-committing ``DROP TABLE`` DDL can't be undone by a rollback once
-        the embedding call raises.
+        Two things protect the previous, working vectors here. First, callers
+        compute ``rows`` (i.e. run the embedder over every symbol) *before*
+        calling this method, so the step that can fail for external reasons
+        happens while the old table is still intact. Second, the swap itself
+        runs in one transaction: SQLite's DDL is transactional, so a failure
+        during the inserts rolls the drop back with it.
 
         A rename-based staged swap was considered but rejected: sqlite-vec's
         ``vec0`` virtual table manages shadow tables that a plain
@@ -226,18 +224,19 @@ class IndexStore:
         """
         if not self.vec_enabled:
             return
-        self.conn.execute("DROP TABLE IF EXISTS chunks_vec")
-        self.conn.execute(
-            f"CREATE VIRTUAL TABLE chunks_vec USING vec0(sid integer primary key, embedding float[{dim}], +path text, +lang text)"
-        )
-        self._vec_table_cached = True
-        if rows:
-            self.conn.executemany(
-                "INSERT INTO chunks_vec(sid, embedding, path, lang) VALUES(?,?,?,?)",
-                [(sid, _encode_vector(vec), path, lang) for sid, vec, path, lang in rows],
+        with self.transaction():
+            self.conn.execute("DROP TABLE IF EXISTS chunks_vec")
+            self.conn.execute(
+                f"CREATE VIRTUAL TABLE chunks_vec USING vec0(sid integer primary key, embedding float[{dim}], +path text, +lang text)"
             )
-        self.set_meta("embedder_dim", str(dim))
-        self.set_meta("embedder_id", embedder_id)
+            if rows:
+                self.conn.executemany(
+                    "INSERT INTO chunks_vec(sid, embedding, path, lang) VALUES(?,?,?,?)",
+                    [(sid, _encode_vector(vec), path, lang) for sid, vec, path, lang in rows],
+                )
+            self.set_meta("embedder_dim", str(dim))
+            self.set_meta("embedder_id", embedder_id)
+        self._vec_table_cached = True
 
     def has_vectors(self) -> bool:
         """Whether at least one vector is stored.

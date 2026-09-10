@@ -262,3 +262,22 @@ def test_index_tools_registered() -> None:
     names = ToolRegistry().get_tool_names()
     assert "reindex" in names
     assert "index_status" in names
+
+
+def test_failed_vector_swap_rolls_back_to_the_previous_vectors(project: Path) -> None:
+    """A crash mid-swap must not leave the project without a vector index."""
+    db = _db(project)
+    Indexer(project, db_path=db).reindex(embedder=HashingEmbedder(dim=16))
+
+    with IndexStore(db) as store:
+        before = store.stats().vectors
+        assert before > 0
+
+        good = [(sid, [0.0] * 16, "app.py", "python") for sid, *_ in [(r[0],) for r in store.all_symbol_rows_for_embedding()]]
+        broken = [*good, (good[0][0], [0.0] * 16, "app.py", "python")]  # duplicate primary key
+        with pytest.raises(sqlite3.Error):
+            store.rebuild_vec_table(16, "hashing-16", broken)
+
+    with IndexStore(db) as store:
+        assert store.stats().vectors == before
+        assert store.get_meta("embedder_id") == "hashing-16"
