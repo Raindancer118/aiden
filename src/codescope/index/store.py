@@ -28,6 +28,28 @@ from codescope.index.parser import RefHit, SymbolDef
 log = logging.getLogger(__name__)
 
 
+def _owner_resolver(symbols: list[SymbolDef], sids: list[int]):  # type: ignore[no-untyped-def]
+    """Build a line -> owning-symbol-id lookup for one file.
+
+    Innermost wins, so a call inside a method belongs to the method rather
+    than to the class around it. Resolving this while the file's symbols are
+    already in hand costs nothing; deriving it per reference at query time
+    was one SQL round trip per reference.
+    """
+    ranges = sorted(
+        ((s.start_line, s.end_line, sid) for s, sid in zip(symbols, sids, strict=True)),
+        key=lambda r: (r[1] - r[0], -r[0]),
+    )
+
+    def owner_of(line: int) -> int | None:
+        for start, end, sid in ranges:
+            if start <= line <= end:
+                return sid
+        return None
+
+    return owner_of
+
+
 def _encode_vector(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
@@ -36,7 +58,7 @@ def _decode_vector(blob: bytes) -> list[float]:
     return list(struct.unpack(f"{len(blob) // 4}f", blob))
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -69,15 +91,22 @@ CREATE INDEX IF NOT EXISTS idx_symbols_path ON symbols(path);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
 
 CREATE TABLE IF NOT EXISTS refs (
-    id    INTEGER PRIMARY KEY,
-    path  TEXT NOT NULL,
-    name  TEXT NOT NULL,
-    kind  TEXT NOT NULL,
-    line  INTEGER NOT NULL,
-    col   INTEGER NOT NULL
+    id       INTEGER PRIMARY KEY,
+    path     TEXT NOT NULL,
+    name     TEXT NOT NULL,
+    kind     TEXT NOT NULL,
+    line     INTEGER NOT NULL,
+    col      INTEGER NOT NULL,
+    -- The symbol whose body contains this reference (its "caller"), resolved
+    -- once at index time. Without it every graph query re-derived ownership
+    -- with one range lookup per reference. NULL for references outside any
+    -- symbol (imports, module-level code).
+    owner_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_refs_name ON refs(name);
 CREATE INDEX IF NOT EXISTS idx_refs_path ON refs(path);
+-- idx_refs_owner is created after _migrate(), which is what adds the column
+-- to indexes built before ownership existed.
 
 CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
     name, path, body, kind UNINDEXED,
@@ -143,10 +172,46 @@ class IndexStore:
 
     def _init_schema(self) -> None:
         self.conn.executescript(_SCHEMA)
+        self._migrate()
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_refs_owner ON refs(owner_id)")
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(SCHEMA_VERSION),),
         )
+
+    def _migrate(self) -> None:
+        """Bring an older index up to the current schema in place.
+
+        Reference ownership is derivable from data an old index already has,
+        so it is backfilled rather than forcing a reindex -- rebuilding a
+        large index is exactly the expensive thing this project tries to
+        avoid asking for.
+        """
+        version = self.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        current = int(version[0]) if version and str(version[0]).isdigit() else 0
+        if current >= SCHEMA_VERSION:
+            return
+
+        columns = {r[1] for r in self.conn.execute("PRAGMA table_info(refs)")}
+        if "owner_id" not in columns:
+            self.conn.execute("ALTER TABLE refs ADD COLUMN owner_id INTEGER")
+        self.backfill_ref_owners()
+        log.info("Migrated the Codescope index from schema %d to %d.", current, SCHEMA_VERSION)
+
+    def backfill_ref_owners(self) -> None:
+        """Resolve ``refs.owner_id`` for rows that do not have it yet.
+
+        Innermost wins: a call inside a method belongs to the method, not to
+        the enclosing class.
+        """
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE refs SET owner_id = ("
+                "  SELECT s.id FROM symbols AS s"
+                "  WHERE s.path = refs.path AND s.start_line <= refs.line AND s.end_line >= refs.line"
+                "  ORDER BY (s.end_line - s.start_line) ASC, s.start_line DESC LIMIT 1"
+                ") WHERE owner_id IS NULL"
+            )
 
     @contextmanager
     def transaction(self) -> Iterator["IndexStore"]:
@@ -387,6 +452,7 @@ class IndexStore:
                 (path, lang, file_hash, mtime, size, indexed_at),
             )
             inserted: list[tuple[int, str, str, str]] = []
+            sids: list[int] = []
             if symbols:
                 cur.executemany(
                     "INSERT INTO symbols(path, name, kind, start_line, start_col, end_line, end_col, signature) VALUES(?,?,?,?,?,?,?,?)",
@@ -408,9 +474,10 @@ class IndexStore:
                 )
                 inserted = [(sid, s.body, path, lang) for sid, s in zip(sids, symbols, strict=True)]
             if refs:
+                owner_of = _owner_resolver(symbols, sids)
                 cur.executemany(
-                    "INSERT INTO refs(path, name, kind, line, col) VALUES(?,?,?,?,?)",
-                    [(path, r.name, r.kind, r.line, r.col) for r in refs],
+                    "INSERT INTO refs(path, name, kind, line, col, owner_id) VALUES(?,?,?,?,?,?)",
+                    [(path, r.name, r.kind, r.line, r.col, owner_of(r.line)) for r in refs],
                 )
         except Exception:
             cur.execute("ROLLBACK TO SAVEPOINT codescope_upsert_file")

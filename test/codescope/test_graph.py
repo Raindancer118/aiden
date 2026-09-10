@@ -8,6 +8,7 @@ import pytest
 
 from codescope.index.graph import GraphEngine
 from codescope.index.indexer import Indexer
+from codescope.index.store import IndexStore
 
 
 @pytest.fixture
@@ -123,3 +124,85 @@ def test_graph_tools_registered() -> None:
     names = ToolRegistry().get_tool_names()
     for t in ("get_dependencies", "get_dependents", "get_call_chain", "get_change_impact", "get_project_map", "get_file_summary"):
         assert t in names
+
+
+# -- materialized reference ownership ----------------------------------------
+
+
+def test_refs_record_their_owning_symbol_at_index_time(tmp_path: Path) -> None:
+    """A reference belongs to the innermost symbol whose body contains it."""
+    (tmp_path / "app.py").write_text("def helper():\n    return 1\n\n\nclass Service:\n    def run(self):\n        return helper()\n")
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embeddings=False)
+
+    with IndexStore(db) as store:
+        owners = dict(
+            store.conn.execute("SELECT r.name, s.name FROM refs AS r JOIN symbols AS s ON s.id = r.owner_id WHERE r.name = 'helper'")
+        )
+        # The call to helper() sits inside run(), not inside the class body.
+        assert owners.get("helper") == "run", owners
+        assert store.conn.execute("SELECT COUNT(*) FROM refs WHERE owner_id IS NULL AND line > 0").fetchone()[0] >= 0
+
+
+def test_dependents_use_the_stored_owner(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("def helper():\n    return 1\n\n\ndef caller():\n    return helper()\n")
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embeddings=False)
+
+    dependents = GraphEngine(tmp_path, db_path=db).dependents("helper")
+    assert [d.name for d in dependents] == ["caller"]
+    assert dependents[0].path == "app.py"
+
+
+def test_existing_index_is_migrated_without_a_reindex(tmp_path: Path) -> None:
+    """An index built before ownership existed must not need rebuilding."""
+    (tmp_path / "app.py").write_text("def helper():\n    return 1\n\n\ndef caller():\n    return helper()\n")
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embeddings=False)
+
+    # Recreate the *actual* old schema: a refs table with no owner_id column.
+    with IndexStore(db) as store:
+        rows = store.conn.execute("SELECT id, path, name, kind, line, col FROM refs").fetchall()
+        store.conn.execute("DROP TABLE refs")
+        store.conn.execute(
+            "CREATE TABLE refs (id INTEGER PRIMARY KEY, path TEXT NOT NULL, name TEXT NOT NULL, "
+            "kind TEXT NOT NULL, line INTEGER NOT NULL, col INTEGER NOT NULL)"
+        )
+        store.conn.executemany("INSERT INTO refs(id, path, name, kind, line, col) VALUES(?,?,?,?,?,?)", rows)
+        store.conn.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
+        store.commit()
+
+    # Opening the store adds the column and backfills it.
+    with IndexStore(db) as store:
+        assert "owner_id" in {r[1] for r in store.conn.execute("PRAGMA table_info(refs)")}
+        assert store.conn.execute("SELECT COUNT(*) FROM refs WHERE owner_id IS NOT NULL").fetchone()[0] > 0
+        assert store.get_meta("schema_version") == "2"
+
+    assert [d.name for d in GraphEngine(tmp_path, db_path=db).dependents("helper")] == ["caller"]
+
+
+def test_references_outside_any_symbol_are_stored_without_an_owner(tmp_path: Path) -> None:
+    """Module-level code has no owning symbol; that is a null, not a crash."""
+    (tmp_path / "script.py").write_text("import os\n\nprint(os.getcwd())\n")
+    db = tmp_path / "idx" / "index.db"
+    assert Indexer(tmp_path, db_path=db).reindex(embeddings=False).errors == 0
+
+    with IndexStore(db) as store:
+        rows = store.conn.execute("SELECT name, owner_id FROM refs WHERE path='script.py'").fetchall()
+        assert rows, "the module-level call should still be indexed as a reference"
+        assert all(owner is None for _name, owner in rows)
+
+
+def test_nested_function_calls_belong_to_the_inner_function(tmp_path: Path) -> None:
+    """Ownership is what separates an outer symbol's callees from an inner one's."""
+    (tmp_path / "app.py").write_text(
+        "def leaf():\n    return 1\n\n\ndef outer():\n    def inner():\n        return leaf()\n    return inner\n"
+    )
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embeddings=False)
+    graph = GraphEngine(tmp_path, db_path=db)
+
+    assert [d.name for d in graph.dependencies("inner")] == ["leaf"]
+    # outer() calls inner(), not leaf() -- the call to leaf is inner's.
+    assert "leaf" not in [d.name for d in graph.dependencies("outer")]
+    assert [d.name for d in graph.dependents("leaf")] == ["inner"]

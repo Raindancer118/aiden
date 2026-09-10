@@ -151,23 +151,20 @@ class GraphEngine:
         return {r[0] for r in store.conn.execute("SELECT DISTINCT name FROM symbols")}
 
     def _dependents(self, store: IndexStore, name: str) -> list[SymbolRef]:
-        """Symbols that reference ``name`` (callers / users)."""
-        rows = store.conn.execute("SELECT path, line FROM refs WHERE name=?", (name,)).fetchall()
-        seen: set[tuple[str, str, str]] = set()
-        out: list[SymbolRef] = []
-        for path, line in rows:
-            caller = self._containing_symbol(store, path, line)
-            if caller is None:
-                continue
-            cname, ckind, cpath, cline = caller
-            if cname == name:  # ignore self-references inside the symbol's own body
-                continue
-            key = (cname, ckind, cpath)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(SymbolRef(name=cname, kind=ckind, path=cpath, start_line=cline))
-        return out
+        """Symbols that reference ``name`` (callers / users).
+
+        One join over the ownership recorded at index time, rather than a
+        range lookup per reference: a widely used symbol had thousands of
+        references and therefore thousands of round trips.
+        """
+        rows = store.conn.execute(
+            "SELECT DISTINCT s.name, s.kind, s.path, s.start_line, s.end_line "
+            "FROM refs AS r JOIN symbols AS s ON s.id = r.owner_id "
+            "WHERE r.name = ? AND s.name != ? "
+            "ORDER BY s.path, s.start_line",
+            (name, name),  # a symbol referencing itself is not its own caller
+        ).fetchall()
+        return [SymbolRef(name=r[0], kind=r[1], path=r[2], start_line=r[3], end_line=r[4]) for r in rows]
 
     def _dependencies(
         self,
@@ -191,9 +188,14 @@ class GraphEngine:
         out: list[SymbolRef] = []
         seen: set[str] = set()
         for path, start, end in defs:
+            # Scope by ownership where it is known, so a reference nested in
+            # an inner function no longer counts as the outer one's callee.
             refs = store.conn.execute(
-                "SELECT DISTINCT name FROM refs WHERE path=? AND line BETWEEN ? AND ?",
-                (path, start, end),
+                "SELECT DISTINCT r.name FROM refs AS r "
+                "LEFT JOIN symbols AS owner ON owner.id = r.owner_id "
+                "WHERE r.path = ? AND r.line BETWEEN ? AND ? "
+                "  AND (r.owner_id IS NULL OR (owner.start_line = ? AND owner.path = ?))",
+                (path, start, end, start, path),
             ).fetchall()
             for (refname,) in refs:
                 if refname == name or refname not in defined or refname in seen:
