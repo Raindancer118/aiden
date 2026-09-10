@@ -62,6 +62,10 @@ _FILTERED_KNN_WIDEN = 8
 #: Neighbours considered per added diff block before the self-match filter.
 _DIFF_CANDIDATES = 5
 
+#: Name candidates scored before the top-k cut. Bounded so a one-word query
+#: on a huge codebase cannot pull the whole symbol table into Python.
+_NAME_CANDIDATE_LIMIT = 2_000
+
 #: Lines of code returned with each hit (head + tail around a fold marker).
 _DEFAULT_PREVIEW_LINES = 12
 
@@ -263,6 +267,11 @@ def _fts_or_query(query: str) -> str | None:
     return " OR ".join(f'"{t}"' for t in tokens)
 
 
+def _escape_like(value: str) -> str:
+    """Escape LIKE wildcards so ``get_user`` cannot match ``getXuserData``."""
+    return value.replace("\\", "\\\\").replace("_", "\\_").replace("%", "\\%")
+
+
 def _fts_phrase(value: str) -> str:
     """Build a quoted FTS5 phrase with embedded quotes escaped."""
     return '"' + value.replace('"', '""') + '"'
@@ -304,28 +313,44 @@ class SearchEngine:
     def _name_ids(self, store: IndexStore, query: str, k: int, flt: SearchFilter | None = None) -> list[int]:
         """Symbols whose *name* the query names outright.
 
-        Agents overwhelmingly search for things they can already name. An
-        exact (or prefix) name match is near-certain relevance, yet BM25
-        spreads it across a body full of common tokens, so it gets its own
-        high-weight ranking rather than competing inside one score.
+        Agents mostly search for things they can already name, and an exact
+        name match is near-certain relevance -- but only when the name really
+        answers the query. Ranking every symbol whose name contains any one
+        query word puts ``new`` at the top of "reuse before writing new code",
+        so candidates are scored by how much of the query their name covers,
+        and a multi-word question needs more than a single incidental word.
         """
-        tokens = {t for t in _WORD_RE.findall(query) if len(t) >= 3}
+        tokens = [t.lower() for t in dict.fromkeys(_WORD_RE.findall(query)) if len(t) >= 3]
         if not tokens:
             return []
         where, params = _filter_sql(flt)
-        # ESCAPE matters: query tokens may contain '_', which LIKE would
-        # otherwise treat as a single-character wildcard ("get_user" matching
-        # "getXuserData") and rank at the highest fusion weight.
-        name_clause = " OR ".join(["s.name = ?"] * len(tokens) + ["s.name LIKE ? ESCAPE '\\'"] * len(tokens))
-        ordered = sorted(tokens)
+        like = " OR ".join(["LOWER(s.name) LIKE ? ESCAPE '\\'"] * len(tokens))
         rows = store.conn.execute(
-            "SELECT s.id FROM symbols AS s JOIN files AS fi ON fi.path = s.path "
-            f"WHERE ({name_clause}){where} "
-            # exact names first, then shortest (least diluted) match
-            "ORDER BY (s.name IN (" + ",".join("?" * len(ordered)) + ")) DESC, LENGTH(s.name) LIMIT ?",
-            (*ordered, *[t.replace("\\", "\\\\").replace("_", "\\_").replace("%", "\\%") + "%" for t in ordered], *params, *ordered, k),
+            f"SELECT s.id, s.name FROM symbols AS s JOIN files AS fi ON fi.path = s.path WHERE ({like}){where} LIMIT ?",
+            (*[f"%{_escape_like(t)}%" for t in tokens], *params, _NAME_CANDIDATE_LIMIT),
         ).fetchall()
-        return [r[0] for r in rows]
+        if not rows:
+            return []
+
+        # Coverage: how many distinct query words the name accounts for.
+        min_coverage = 2 if len(tokens) >= 3 else 1
+        scored: list[tuple[int, int, int, int]] = []
+        for sid, name in rows:
+            lowered = name.lower()
+            covered = sum(1 for t in tokens if t in lowered)
+            exact = 1 if lowered in tokens else 0
+            scored.append((covered, exact, -len(name), sid))
+        best = [entry for entry in scored if entry[0] >= min_coverage]
+        if not best and len(tokens) < 3:
+            # A one- or two-word query really is naming something.
+            best = [entry for entry in scored if entry[1]]
+        if not best:
+            # No name answers this question. Contributing a weak guess here
+            # would hand it the highest fusion weight; BM25 and the vector
+            # index are better placed to answer a prose query.
+            return []
+        best.sort(reverse=True)
+        return [sid for _c, _e, _l, sid in best[:k]]
 
     def _vector_ids(self, store: IndexStore, query: str, k: int, flt: SearchFilter | None = None) -> list[int]:
         qvec = self._embed_query(store, query)

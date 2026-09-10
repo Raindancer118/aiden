@@ -571,3 +571,35 @@ def test_filtered_vector_search_agrees_with_an_exact_scan(indexed_multi: tuple[P
     assert set(swept) <= allowed
     # Same top result either way; the sweep may order deeper ties differently.
     assert swept[0] == exact[0]
+
+
+def test_common_names_do_not_hijack_a_natural_language_query(tmp_path: Path) -> None:
+    """'new' is ordinary English and the name of dozens of methods."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    for i in range(30):
+        (pkg / f"m{i}.py").write_text(f"class C{i}:\n    def new(self):\n        return {i}\n")
+    (tmp_path / "reuse.py").write_text(
+        "def find_existing_helper(snippet):\n"
+        "    '''Look for code that already exists before writing new code.'''\n"
+        "    return search_index(snippet)\n"
+    )
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embedder=HashingEmbedder())
+
+    hits = SearchEngine(tmp_path, db_path=db).hybrid_search("find code that already exists before writing new code", limit=5)
+    assert hits
+    assert hits[0].name == "find_existing_helper", [h.name for h in hits]
+
+
+def test_a_query_of_only_common_names_still_finds_them(tmp_path: Path) -> None:
+    """Dropping every token would answer nothing; keep them when that happens."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    for i in range(30):
+        (pkg / f"m{i}.py").write_text(f"class C{i}:\n    def new(self):\n        return {i}\n")
+    db = tmp_path / "idx" / "index.db"
+    Indexer(tmp_path, db_path=db).reindex(embedder=HashingEmbedder())
+
+    hits = SearchEngine(tmp_path, db_path=db).hybrid_search("new", limit=5)
+    assert hits and all(h.name == "new" for h in hits)
