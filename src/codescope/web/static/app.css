@@ -46,6 +46,10 @@
 
 * { box-sizing: border-box; }
 
+/* A class that sets `display` beats the user agent's [hidden] rule, and every
+   panel here sets one -- so hidden has to win explicitly. */
+[hidden] { display: none !important; }
+
 html, body { height: 100%; }
 
 body {
@@ -262,6 +266,7 @@ body {
 
 .action-toast.failed { border-left-color: var(--danger); }
 .action-toast.done { border-left-color: var(--out); }
+.action-toast.skipped { border-left-color: var(--warn); }
 
 /* ---------- layout ---------- */
 
@@ -692,6 +697,93 @@ pre.code {
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--out); }
 .status-dot.bad { background: var(--danger); }
 .status-dot.warn { background: var(--warn); }
+
+/* ---------- index progress ---------- */
+
+.progress-item { gap: 8px; }
+
+.progress-bar {
+  width: 110px;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.progress-bar > i {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width .25s ease;
+}
+
+/* A phase with no countable total (scanning, loading a model) still has to
+   look alive, so the bar sweeps instead of sitting at zero. */
+.progress-bar.indeterminate > i {
+  width: 34%;
+  animation: sweep 1.15s ease-in-out infinite;
+}
+
+.progress-item.failed .progress-bar > i { background: var(--danger); }
+.progress-item.done .progress-bar > i { background: var(--out); }
+
+@keyframes sweep {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(330%); }
+}
+
+.status-dot.live {
+  background: var(--out);
+  animation: pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: .35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-bar.indeterminate > i { animation: none; width: 100%; opacity: .5; }
+  .status-dot.live { animation: none; }
+}
+
+/* A button whose action is already in effect: still readable, clearly not a
+   thing to press again. */
+.ghost-button.is-active {
+  border-color: var(--out);
+  color: var(--out);
+  background: color-mix(in srgb, var(--out) 12%, transparent);
+}
+
+.ghost-button:disabled { opacity: .45; cursor: default; }
+
+/* ---------- tooltips ---------- */
+
+.tip {
+  position: fixed;
+  z-index: 60;
+  max-width: 300px;
+  padding: 7px 10px;
+  background: var(--bg-raised);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  font: 12px/1.45 var(--sans);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .12s ease;
+}
+
+.tip.shown { opacity: 1; }
+.tip b { font-family: var(--mono); font-weight: 600; }
+.tip .tip-sub { display: block; margin-top: 3px; color: var(--text-dim); }
+
+@media (prefers-reduced-motion: reduce) {
+  .tip { transition: none; }
+}
 
 /* ---------- responsive ---------- */
 

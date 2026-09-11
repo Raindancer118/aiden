@@ -22,37 +22,38 @@
 
   <label class="project-picker">
     <span class="sr-only">Project</span>
-    <select id="project-select"></select>
+    <select id="project-select" data-tip="Switch between the projects this Codescope server knows about."></select>
   </label>
 
   <div class="search">
     <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="6" fill="none" stroke="currentColor" stroke-width="2"/><path d="M13.5 13.5 18 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-    <input id="search-input" type="search" placeholder="Search this codebase by meaning or name…" autocomplete="off" spellcheck="false">
+    <input id="search-input" type="search" placeholder="Search this codebase by meaning or name…" autocomplete="off" spellcheck="false"
+           data-tip="Hybrid search: plain words match by meaning, identifiers match by name. Press / to focus.">
     <kbd>/</kbd>
   </div>
 
-  <label class="toggle" title="Skip symbols defined in test files">
+  <label class="toggle" data-tip="Skip symbols defined in test files, so results show the implementation rather than its tests.">
     <input type="checkbox" id="exclude-tests"><span>Hide tests</span>
   </label>
 
   <div class="actions" role="group" aria-label="Index actions">
-    <button class="ghost-button" data-action="sync" type="button" title="Reindex only what git reports as changed">Sync</button>
-    <button class="ghost-button" data-action="reindex" type="button" title="Rebuild the index (incremental; unchanged files are skipped)">Reindex</button>
-    <button class="ghost-button" data-action="watch_start" type="button" title="Keep the index fresh in the background">Watch</button>
-    <button class="ghost-button" data-action="watch_stop" type="button" title="Stop the background watcher">Stop</button>
+    <button class="ghost-button" data-action="sync" type="button" data-tip="Reindex only the files git reports as changed. Fast; the usual way to catch up.">Sync</button>
+    <button class="ghost-button" data-action="reindex" type="button" data-tip="Walk the whole project and reindex it. Unchanged files are skipped, so this is safe to run any time.">Reindex</button>
+    <button class="ghost-button" data-action="watch_start" id="watch-toggle" type="button" aria-pressed="false"
+            data-tip="Keep the index fresh in the background: every saved file is reindexed automatically.">Watch</button>
   </div>
 
-  <button class="project-count" id="project-count" type="button" title="Projects Codescope knows about">
+  <button class="project-count" id="project-count" type="button" data-tip="Every project attached to this Codescope server. Click to switch or add one.">
     <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 5.5A1.5 1.5 0 0 1 4 4h3.4l1.4 1.8H16a1.5 1.5 0 0 1 1.5 1.5v7.2A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
     <b id="project-count-value">–</b>
     <span class="project-count-label">open</span>
   </button>
 
-  <button class="icon-button" id="theme-toggle" type="button" title="Switch theme" aria-label="Switch theme">
+  <button class="icon-button" id="theme-toggle" type="button" data-tip="Switch between the dark and light theme." aria-label="Switch theme">
     <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5a7.5 7.5 0 1 0 7.5 7.5A6 6 0 0 1 10 2.5Z" fill="currentColor"/></svg>
   </button>
 
-  <button class="icon-button danger" id="shutdown" type="button" title="Shut down every attached instance and this server" aria-label="Shut down Codescope">
+  <button class="icon-button danger" id="shutdown" type="button" data-tip="Shut down every attached Codescope instance and this server. Nothing is deleted; the index stays on disk." aria-label="Shut down Codescope">
     <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M6 5.5a6 6 0 1 0 8 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
   </button>
 </header>
@@ -74,10 +75,10 @@
 
   <aside class="panel results" aria-label="Results">
     <div class="tabs" role="tablist">
-      <button class="tab" role="tab" data-tab="search" aria-selected="true">Search</button>
-      <button class="tab" role="tab" data-tab="files" aria-selected="false">Files</button>
-      <button class="tab" role="tab" data-tab="clones" aria-selected="false">Clones</button>
-      <button class="tab" role="tab" data-tab="health" aria-selected="false">Health</button>
+      <button class="tab" role="tab" data-tab="search" aria-selected="true" data-tip="Search results, or the most referenced symbols when the box is empty.">Search</button>
+      <button class="tab" role="tab" data-tab="files" aria-selected="false" data-tip="Browse the indexed files of this project.">Files</button>
+      <button class="tab" role="tab" data-tab="clones" aria-selected="false" data-tip="Near-duplicate code: blocks that already exist elsewhere in this project.">Clones</button>
+      <button class="tab" role="tab" data-tab="health" aria-selected="false" data-tip="What the index can and cannot answer right now, and what a run is currently doing.">Health</button>
     </div>
     <div class="panel-head">
       <h2 id="results-title">Most referenced</h2>
@@ -94,13 +95,13 @@
     <div class="panel-head">
       <h2 id="graph-title">Call graph</h2>
       <div class="graph-actions">
-        <span class="legend" id="legend-in"><i class="dot in"></i>calls in</span>
-        <span class="legend" id="legend-out"><i class="dot out"></i>calls out</span>
+        <span class="legend" id="legend-in" data-tip="Callers: symbols that call the selected one."><i class="dot in"></i>calls in</span>
+        <span class="legend" id="legend-out" data-tip="Callees: symbols the selected one calls."><i class="dot out"></i>calls out</span>
         <div class="segmented" role="group" aria-label="Graph scope">
-          <button class="ghost-button" id="view-symbol" type="button" aria-pressed="true">Symbol</button>
-          <button class="ghost-button" id="view-project" type="button" aria-pressed="false">Whole project</button>
+          <button class="ghost-button" id="view-symbol" type="button" aria-pressed="true" data-tip="Show the callers and callees around one symbol.">Symbol</button>
+          <button class="ghost-button" id="view-project" type="button" aria-pressed="false" data-tip="Show how directories and modules in this project depend on each other.">Whole project</button>
         </div>
-        <button class="ghost-button" id="graph-back" type="button" disabled>Back</button>
+        <button class="ghost-button" id="graph-back" type="button" disabled data-tip="Go back to the previously focused symbol.">Back</button>
       </div>
     </div>
     <div class="graph-canvas" id="graph-canvas">
@@ -125,12 +126,21 @@
 </main>
 
 <footer class="statusbar" id="statusbar">
-  <span class="status-item" id="status-index">…</span>
+  <span class="status-item" id="status-index" data-tip="Files and symbols currently in this project's index.">…</span>
   <span class="status-item" id="status-embed"></span>
+  <span class="status-item progress-item" id="status-progress" hidden>
+    <span class="progress-bar"><i id="progress-fill"></i></span>
+    <span id="progress-label"></span>
+  </span>
+  <span class="status-item" id="status-watch" hidden data-tip="A background watcher is reindexing files as you save them.">
+    <span class="status-dot live"></span><span id="status-watch-label">watching</span>
+  </span>
   <span class="status-item" id="status-advice"></span>
   <span class="spacer"></span>
   <span class="status-item muted" id="status-projects"></span>
 </footer>
+
+<div class="tip" id="tip" role="tooltip" hidden></div>
 
 <script src="app.js"></script>
 </body>

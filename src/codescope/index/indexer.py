@@ -11,12 +11,14 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import blake3
 import pathspec
 
+from codescope.index import progress
 from codescope.index.embed import Embedder, HashingEmbedder, build_embed_text, get_embedder
 from codescope.index.languages import spec_for_path
 from codescope.index.parser import TreeSitterParser
@@ -92,6 +94,20 @@ class Indexer:
         self.embedder_name = embedder_name
         self.parser = TreeSitterParser()
         self._gitignore = self._load_gitignore()
+        # A detached run, so index work started outside :meth:`_track` (tests,
+        # direct index_file calls) reports into something harmless.
+        self._progress = progress.IndexProgress(root=str(self.root), operation="idle")
+
+    @contextmanager
+    def _track(self, operation: str) -> Iterator[progress.IndexProgress]:
+        """Publish this run's progress for the duration of ``operation``."""
+        with progress.track(self.root, operation) as run:
+            previous = self._progress
+            self._progress = run
+            try:
+                yield run
+            finally:
+                self._progress = previous
 
     def _load_gitignore(self) -> pathspec.PathSpec | None:
         gi = self.root / ".gitignore"
@@ -209,32 +225,47 @@ class Indexer:
         are embedded and stored for semantic search. When force-reindexing only
         part of the tree, embeddings are (re)built for the affected symbols.
         """
+        with self._track("reindex"):
+            return self._reindex(force=force, embeddings=embeddings, embedder=embedder)
+
+    def _reindex(self, *, force: bool, embeddings: bool, embedder: Embedder | None) -> ReindexReport:
         start = time.time()
         indexed = skipped = errors = 0
         seen: set[str] = set()
         store = IndexStore(self.db_path)
+        run = self._progress
         try:
             self._gitignore = self._load_gitignore()
 
+            # Collected up front rather than streamed so the run can report a real
+            # total; paths are cheap next to the parsing that follows.
+            run.set_phase("scanning", detail="walking the project")
+            sources = list(self.iter_source_files())
+            run.set_phase("parsing", total=len(sources))
+
             batch: list[tuple[Path, str]] = []
-            for abs_path, rel in self.iter_source_files():
+            for abs_path, rel in sources:
                 seen.add(rel)
                 batch.append((abs_path, rel))
                 if len(batch) < _COMMIT_EVERY_FILES:
                     continue
                 counts = self._index_batch(store, batch, force=force)
                 indexed, errors, skipped = indexed + counts[0], errors + counts[1], skipped + counts[2]
+                run.advance(len(batch), detail=batch[-1][1])
                 batch.clear()
             if batch:
                 counts = self._index_batch(store, batch, force=force)
                 indexed, errors, skipped = indexed + counts[0], errors + counts[1], skipped + counts[2]
+                run.advance(len(batch), detail=batch[-1][1])
 
             # Prune files removed from disk.
             removed = 0
+            run.set_phase("pruning")
             with store.transaction():
                 for stale in store.indexed_paths() - seen:
                     store.delete_file(stale)
                     removed += 1
+                    run.advance()
 
             # persist the lexical index before model loading or vectorization,
             # both of which may be slow or depend on optional external assets.
@@ -291,13 +322,27 @@ class Indexer:
         files changed, but the per-file hash still prevents redundant writes
         when ``force`` is False.
         """
+        with self._track("sync"):
+            return self._reindex_paths(rel_paths, force=force, embeddings=embeddings, embedder=embedder)
+
+    def _reindex_paths(
+        self,
+        rel_paths: list[str],
+        *,
+        force: bool,
+        embeddings: bool,
+        embedder: Embedder | None,
+    ) -> ReindexReport:
         start = time.time()
         indexed = skipped = errors = removed = 0
         store = IndexStore(self.db_path)
         try:
             self._gitignore = self._load_gitignore()
             indexed_paths = store.indexed_paths()
-            for raw_rel in dict.fromkeys(rel_paths):  # de-dup, preserve order
+            targets = list(dict.fromkeys(rel_paths))  # de-dup, preserve order
+            self._progress.set_phase("parsing", total=len(targets))
+            for raw_rel in targets:
+                self._progress.advance(detail=raw_rel)
                 rel_path = PurePosixPath(raw_rel)
                 windows_path = PureWindowsPath(raw_rel)
                 if (
@@ -387,7 +432,8 @@ class Indexer:
                 )
                 return
             rows = [row for row in store.all_symbol_rows_for_embedding() if row[6].strip()]
-            embedded = self._embed_rows(embedder, rows)
+            self._progress.set_phase("embedding", total=len(rows), detail="rebuilding every vector")
+            embedded = self._embed_rows(embedder, rows, self._progress)
             store.rebuild_vec_table(embedder.dim, embedder.id, embedded)
             store.commit()
             return
@@ -395,7 +441,8 @@ class Indexer:
         store.ensure_vec_table(embedder.dim, embedder.id)
         pending = store.symbols_without_embeddings()
         if pending:
-            self._embed_pending(store, embedder, pending)
+            self._progress.set_phase("embedding", total=len(pending), detail="backfilling vectors")
+            self._embed_pending(store, embedder, pending, self._progress)
         store.commit()
 
     @staticmethod
@@ -405,7 +452,7 @@ class Indexer:
 
     @classmethod
     def _embed_rows(
-        cls, embedder: Embedder, rows: list[tuple[int, str, str, str, str, str, str]]
+        cls, embedder: Embedder, rows: list[tuple[int, str, str, str, str, str, str]], run: progress.IndexProgress | None = None
     ) -> list[tuple[int, list[float], str, str]]:
         """Embed symbol rows, buffering the result.
 
@@ -418,10 +465,18 @@ class Indexer:
         for batch in embedder.embed_batched(cls._embed_texts(rows)):
             for index, vector in batch:
                 out.append((rows[index][0], vector, rows[index][1], rows[index][2]))
+            if run is not None:
+                run.advance(len(batch))
         return out
 
     @classmethod
-    def _embed_pending(cls, store: IndexStore, embedder: Embedder, pending: list[tuple[int, str, str, str, str, str, str]]) -> None:
+    def _embed_pending(
+        cls,
+        store: IndexStore,
+        embedder: Embedder,
+        pending: list[tuple[int, str, str, str, str, str, str]],
+        run: progress.IndexProgress | None = None,
+    ) -> None:
         """Embed and persist missing vectors batch by batch (interruptible)."""
         rows = [row for row in pending if row[6].strip()]
         if not rows:
@@ -431,6 +486,8 @@ class Indexer:
             store.insert_embeddings([(rows[i][0], vec, rows[i][1], rows[i][2]) for i, vec in batch])
             store.commit()
             done += len(batch)
+            if run is not None:
+                run.advance(len(batch))
             if done % 512 < len(batch):
                 log.info("Embedded %d/%d symbols", done, len(rows))
 
@@ -440,6 +497,18 @@ class Indexer:
             return store.stats()
         finally:
             store.close()
+
+    def live_state(self) -> dict:
+        """What is happening to this index right now, in this process.
+
+        Progress and watcher state are per process: a run started by the MCP
+        server is visible to the MCP server, one started by the explorer to the
+        explorer. Both are the process the caller is asking from, which is the
+        one whose answer matters.
+        """
+        from codescope.index.watcher import watcher_status
+
+        return {"progress": progress.snapshot(self.root), "watcher": watcher_status(self.root)}
 
     def health(self) -> dict:
         """What the index can and cannot answer right now.
@@ -451,11 +520,18 @@ class Indexer:
         """
         exists = self.db_path.exists()
         advice: list[str] = []
+        live = self.live_state()
         if not exists:
+            building = live["progress"] is not None and live["progress"]["running"]
             return {
                 "indexed": False,
                 "db_path": str(self.db_path),
-                "advice": ["No index yet. Run reindex (or `codescope index build`) before searching."],
+                "advice": [
+                    "An index is being built right now; results will be incomplete until it finishes."
+                    if building
+                    else "No index yet. Run reindex (or `codescope index build`) before searching."
+                ],
+                **live,
             }
 
         store = IndexStore(self.db_path)
@@ -503,6 +579,7 @@ class Indexer:
             "head_moved_since_index": behind,
             "languages": stats.languages,
             "advice": advice,
+            **live,
         }
 
     def _indexed_head_moved(self) -> bool | None:

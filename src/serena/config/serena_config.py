@@ -315,6 +315,15 @@ class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
     SERENA_PROJECT_FILE = "project.yml"
     SERENA_LOCAL_PROJECT_FILE = "project.local.yml"
     FIELDS_WITHOUT_DEFAULTS = {"project_name", "languages"}
+    LANGUAGE_FIELD_ALIASES = ("language_servers", "language")
+    """
+    other spellings of the ``languages`` field found in project.yml files in the wild:
+    ``language_servers`` (newer Serena releases) and the historical singular ``language``.
+    """
+    MIN_AUTODETECTED_LANGUAGE_SHARE = 0.10
+    """minimum share of a repository's source files before a language server is enabled automatically"""
+    MAX_AUTODETECTED_LANGUAGES = 4
+    """upper bound on automatically enabled language servers, so a polyglot repo cannot spawn a server fleet"""
     YAML_COMMENT_NORMALISATION = YamlCommentNormalisation.LEADING
     """
     the comment normalisation strategy to use when loading/saving project configuration files.
@@ -377,6 +386,13 @@ class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
                     top_language_pair = languages_and_percentages[0]
                     other_language_pairs = languages_and_percentages[1:]
                     languages_to_use = [top_language_pair[0].value]
+                    # Enable every other language that carries a meaningful share of the repository.
+                    # A single enabled language is wrong for the common backend+frontend repo: symbol
+                    # tools then refuse every file of the other half ("Active languages: ['typescript']").
+                    if not interactive:
+                        for lang in cls._significant_languages(language_composition):
+                            if lang.value not in languages_to_use:
+                                languages_to_use.append(lang.value)
                     # if in interactive mode, ask the user which other languages to enable
                     if len(other_language_pairs) > 0 and interactive:
                         print(
@@ -408,6 +424,31 @@ class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
                 shutil.copy(PROJECT_LOCAL_TEMPLATE_FILE, project_local_yml_path)
 
             return cls._from_dict(config_with_comments, local_override_keys=[])
+
+    @classmethod
+    def _significant_languages(cls, composition: dict[Language, float]) -> list[Language]:
+        """The languages a repository is actually written in, most prevalent first.
+
+        ``composition`` maps a language to its share of *all* files, so the shares are
+        renormalised over the programming languages alone before the threshold is applied:
+        a repo that is half JSON should not thereby lose its Java.
+        """
+        code = {lang: pct for lang, pct in composition.items() if lang.is_programming_language() and pct > 0}
+        if not code:
+            return []
+        ranked = sorted(code.items(), key=lambda item: (item[1], item[0].get_priority()), reverse=True)
+        total = sum(pct for _, pct in ranked)
+        kept = [ranked[0][0]]
+        for lang, pct in ranked[1:]:
+            if pct / total >= cls.MIN_AUTODETECTED_LANGUAGE_SHARE:
+                kept.append(lang)
+        return kept[: cls.MAX_AUTODETECTED_LANGUAGES]
+
+    @classmethod
+    def detect_languages(cls, project_root: str | Path) -> list[Language]:
+        """Detect the languages worth enabling for a project on disk."""
+        composition = determine_programming_language_composition(str(project_root))
+        return cls._significant_languages(composition)
 
     @classmethod
     def default_project_yml_path(cls, project_root: str | Path) -> str:
@@ -457,10 +498,14 @@ class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
 
         # backward compatibility
         # NOTE: This must also work for project.local.yml files, which may be highly incomplete
-        # * handle single "language" field
-        if "languages" not in data and "language" in data:
-            data["languages"] = [data["language"]]
-            del data["language"]
+        # * accept the other spellings of the languages field (see LANGUAGE_FIELD_ALIASES)
+        for alias in cls.LANGUAGE_FIELD_ALIASES:
+            if alias not in data:
+                continue
+            value = data[alias]
+            if "languages" not in data and value is not None:
+                data["languages"] = list(value) if isinstance(value, list) else [value]
+            del data[alias]
 
         # Note: Checks for validity of fields must not happen here but in _from_dict.
         # Here, the data may be incomplete, because this function is also used for
@@ -479,7 +524,9 @@ class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
         """
         lang_name_mapping = {"javascript": "typescript"}
         languages: list[Language] = []
-        for language_str in data["languages"]:
+        # a missing/empty field is not an error here: ProjectConfig.load repairs it by
+        # detecting the languages actually present in the project.
+        for language_str in data.get("languages") or []:
             orig_language_str = language_str
             try:
                 language_str = language_str.lower()
@@ -607,6 +654,22 @@ class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
 
         # instantiate the ProjectConfig
         project_config = cls._from_dict(yaml_data, local_override_keys=local_override_keys)
+
+        # Repair a configuration that names no language at all (written by a Serena version with a
+        # different field name, or hand-edited). Without this, every symbol tool is dead for the
+        # project and the only symptom is a KeyError or an empty "Active languages" list.
+        if not project_config.languages:
+            detected = cls.detect_languages(project_root)
+            if detected:
+                log.info(
+                    "Project configuration in %s names no language; detected %s from the project contents",
+                    yaml_path,
+                    [lang.value for lang in detected],
+                )
+                project_config.languages = detected
+                was_complete = False
+            else:
+                log.warning("Project configuration in %s names no language and none could be detected in %s", yaml_path, project_root)
 
         # if the configuration was incomplete, re-save it to disk
         if not was_complete:

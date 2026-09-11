@@ -35,6 +35,13 @@ const dom = {
   statusEmbed: el("status-embed"),
   statusAdvice: el("status-advice"),
   statusProjects: el("status-projects"),
+  statusProgress: el("status-progress"),
+  progressFill: el("progress-fill"),
+  progressLabel: el("progress-label"),
+  statusWatch: el("status-watch"),
+  statusWatchLabel: el("status-watch-label"),
+  watchToggle: el("watch-toggle"),
+  tip: el("tip"),
 };
 
 /* ---------- helpers ---------- */
@@ -148,8 +155,112 @@ async function loadStatus() {
 
   const advice = (health.advice || [])[0] || "";
   dom.statusAdvice.textContent = advice;
-  dom.statusAdvice.title = (health.advice || []).join("\n");
+  dom.statusAdvice.dataset.tip = (health.advice || []).join("\n");
   dom.statusAdvice.className = advice ? "status-item warn" : "status-item";
+
+  renderLiveState(health);
+}
+
+/* ---------- live index state ---------- */
+
+/* The index run and the watcher are the two things that move on their own, so
+ * they are polled separately from the (much heavier) health payload. */
+
+const PHASE_LABEL = {
+  starting: "starting",
+  scanning: "scanning files",
+  parsing: "indexing",
+  pruning: "pruning",
+  embedding: "embedding",
+  done: "indexed",
+  failed: "failed",
+};
+
+function formatDuration(seconds) {
+  if (seconds === null || seconds === undefined) return "";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${Math.round(seconds % 60)}s`;
+}
+
+function renderLiveState(live) {
+  renderProgress(live.progress);
+  renderWatcher(live.watcher, live.running_actions || []);
+}
+
+function renderProgress(run) {
+  if (!run || (!run.running && run.phase === "done" && run.elapsed_s > 20)) {
+    dom.statusProgress.hidden = true;
+    return;
+  }
+  dom.statusProgress.hidden = false;
+  const phase = PHASE_LABEL[run.phase] || run.phase;
+  const bar = dom.progressFill.parentElement;
+  const known = run.percent !== null && run.percent !== undefined;
+
+  bar.classList.toggle("indeterminate", run.running && !known);
+  dom.progressFill.style.width = known ? `${run.percent}%` : "";
+  dom.statusProgress.className = `status-item progress-item${run.running ? "" : " " + run.phase}`;
+
+  let label;
+  if (!run.running && run.error) {
+    label = `${run.operation} failed`;
+  } else if (!run.running) {
+    label = `${run.operation} finished in ${formatDuration(run.elapsed_s)}`;
+  } else if (run.total) {
+    label = `${phase} ${run.done}/${run.total}`;
+    if (run.eta_s !== null && run.eta_s !== undefined) label += ` · ${formatDuration(run.eta_s)} left`;
+  } else {
+    label = phase;
+  }
+  dom.progressLabel.textContent = label;
+
+  const lines = [`${run.operation}: ${phase}`];
+  if (run.total) lines.push(`${run.done} of ${run.total}`);
+  if (run.detail) lines.push(run.detail);
+  lines.push(`running for ${formatDuration(run.elapsed_s)}`);
+  if (run.error) lines.push(run.error);
+  dom.statusProgress.dataset.tip = lines.join("\n");
+}
+
+function renderWatcher(watcher, runningActions) {
+  const running = Boolean(watcher && watcher.running);
+  dom.statusWatch.hidden = !running;
+  if (running) {
+    const parts = [`${watcher.files_reindexed} file(s) reindexed in ${watcher.batches} batch(es)`];
+    if (watcher.uptime_s) parts.push(`up for ${formatDuration(watcher.uptime_s)}`);
+    if (watcher.error) parts.push(`last error: ${watcher.error}`);
+    dom.statusWatchLabel.textContent = "watching";
+    dom.statusWatch.dataset.tip = `A watcher keeps this index fresh.\n${parts.join("\n")}`;
+  }
+
+  // One button, two states: pressing it again stops the watcher rather than
+  // trying (and failing) to start a second one.
+  if (dom.watchToggle) {
+    dom.watchToggle.classList.toggle("is-active", running);
+    dom.watchToggle.setAttribute("aria-pressed", running ? "true" : "false");
+    dom.watchToggle.textContent = running ? "Watching" : "Watch";
+    dom.watchToggle.dataset.action = running ? "watch_stop" : "watch_start";
+    dom.watchToggle.disabled = runningActions.includes("watch_start") || runningActions.includes("watch_stop");
+    dom.watchToggle.dataset.tip = running
+      ? "A watcher is keeping this index fresh. Click to stop it."
+      : "Keep the index fresh in the background: every saved file is reindexed automatically.";
+  }
+
+  document.querySelectorAll('.actions [data-action="sync"], .actions [data-action="reindex"]').forEach((button) => {
+    const busy = runningActions.includes("reindex") || runningActions.includes("sync");
+    button.disabled = busy;
+    if (busy) button.dataset.tip = "An index run is already in progress for this project.";
+  });
+}
+
+async function loadLiveState() {
+  if (!state.projectId) return;
+  try {
+    renderLiveState(await api(projectPath("progress")));
+  } catch {
+    /* the server may be shutting down; the next tick will tell us */
+  }
 }
 
 /* ---------- results ---------- */
@@ -202,6 +313,14 @@ function renderResults(rows, emptyMessage) {
       line.append(node("b", null, row.name), node("span", "kind", row.kind || "symbol"));
       if (row.callers) line.append(node("span", "callers-badge", `${row.callers} in`));
       button.append(line, node("div", "result-path", `${shortPath(row.path)}:${row.start_line}`));
+      button.dataset.tip = [
+        `${row.kind || "symbol"} ${row.name}`,
+        `${row.path}:${row.start_line}`,
+        row.callers ? `${row.callers} caller(s) in this project` : "",
+        "Click to see what calls it and what it calls.",
+      ]
+        .filter(Boolean)
+        .join("\n");
       button.addEventListener("click", () => focusSymbol(row.name, row.path, { push: true }));
       item.append(button);
       return item;
@@ -489,6 +608,7 @@ try {
 refreshProjects();
 setInterval(refreshProjects, 4000);
 setInterval(() => state.projectId && loadStatus(), 15000);
+setInterval(loadLiveState, 1000);
 
 /* ---------- project count ---------- */
 
@@ -598,15 +718,25 @@ function toast(message, kind) {
 }
 
 async function runAction(action, button) {
-  if (!state.projectId) return;
+  if (!state.projectId || button.disabled) return;
   button.disabled = true;
   try {
-    await post(projectPath(`actions/${action}`), {});
-    toast(`${action} started…`);
+    const response = await post(projectPath(`actions/${action}`), {});
+    const body = await response.json().catch(() => ({}));
+    if (response.status === 409) {
+      // Nothing was started, and saying "started…" here is how you end up
+      // pressing Watch four times and believing you have four watchers.
+      toast(body.detail || `${action} is already running`, "skipped");
+    } else if (!response.ok) {
+      toast(body.error || `${action} could not be started`, "failed");
+    } else {
+      toast(`${action} started…`);
+    }
   } catch (error) {
     toast(`${action} could not be started: ${error.message}`, "failed");
   } finally {
-    setTimeout(() => (button.disabled = false), 1200);
+    await loadLiveState();
+    if (button.id !== "watch-toggle") setTimeout(() => (button.disabled = false), 600);
   }
 }
 
@@ -621,6 +751,7 @@ async function pollEvents() {
     lastEventId = Math.max(lastEventId, event.id);
     if (event.status === "running") continue;
     toast(`${event.action} on ${event.project}: ${event.detail}`, event.status);
+    loadLiveState();
     if (event.status === "done" && event.action !== "watch_stop") {
       loadStatus();
       if (!dom.search.value.trim()) loadOverview();
@@ -631,6 +762,9 @@ async function pollEvents() {
 document.querySelectorAll(".actions [data-action]").forEach((button) => {
   button.addEventListener("click", () => runAction(button.dataset.action, button));
 });
+
+/* The watch toggle re-enables itself from the polled watcher state, not from a
+ * timer, so it never re-arms while the watcher is still coming up. */
 
 /* ---------- whole-project graph ---------- */
 
@@ -811,25 +945,59 @@ const tabs = {
     dom.resultsTitle.textContent = "Health";
     setCrumbs(null);
     const health = await api(projectPath("status"));
+    renderLiveState(health);
     const list = node("dl", "health-list");
-    const add = (key, value) => {
+    const add = (key, value, tip) => {
       const row = node("div", "health-row");
       row.append(node("dt", null, key), node("dd", null, String(value)));
+      if (tip) row.dataset.tip = tip;
       list.append(row);
     };
-    add("indexed", health.indexed ? "yes" : "no");
+
+    const run = health.progress;
+    if (run) {
+      const phase = PHASE_LABEL[run.phase] || run.phase;
+      const counts = run.total ? ` ${run.done}/${run.total}` : "";
+      add(
+        run.running ? "index run" : "last index run",
+        run.running
+          ? `${run.operation}: ${phase}${counts}`
+          : `${run.operation} ${run.error ? "failed" : "finished"} after ${formatDuration(run.elapsed_s)}`,
+        run.error || run.detail || "The index run this server most recently started."
+      );
+    }
+    add(
+      "watcher",
+      health.watcher && health.watcher.running ? "running" : "not running",
+      health.watcher && health.watcher.running
+        ? `${health.watcher.files_reindexed} file(s) reindexed in ${health.watcher.batches} batch(es)`
+        : "Press Watch to keep this index fresh automatically."
+    );
+
+    add("indexed", health.indexed ? "yes" : "no", "Whether this project has an index at all.");
     if (health.indexed) {
-      add("files", health.files);
-      add("symbols", health.symbols);
-      add("references", health.refs);
-      add("vectors", health.vectors);
-      add("symbols without a vector", health.symbols_missing_vectors);
-      add("embedder", health.embedder || "none");
-      add("semantic search", health.semantic_search_ready ? "ready" : "unavailable");
-      add("clone detection", health.clone_detection_ready ? "ready" : "unavailable");
-      add("uncommitted changes", health.uncommitted_changes ?? "not a git repo");
-      add("HEAD moved since index", health.head_moved_since_index === null ? "unknown" : String(health.head_moved_since_index));
-      add("database", `${(health.db_size_bytes / 1048576).toFixed(1)} MB`);
+      add("files", health.files, "Source files currently represented in the index.");
+      add("symbols", health.symbols, "Definitions (functions, classes, methods …) extracted from those files.");
+      add("references", health.refs, "Call and usage sites, which is what the call graph is built from.");
+      add("vectors", health.vectors, "Embedded symbols. Semantic search and clone detection need these.");
+      add("symbols without a vector", health.symbols_missing_vectors, "Reindexing resumes the backfill where it stopped.");
+      add("embedder", health.embedder || "none", "The embedding model this index was built with. Changing it forces a full re-embed.");
+      add("semantic search", health.semantic_search_ready ? "ready" : "unavailable", "Searching by meaning rather than by name.");
+      add("clone detection", health.clone_detection_ready ? "ready" : "unavailable", "Finding near-duplicate code needs real vectors.");
+      const languages = Object.entries(health.languages || {}).sort((a, b) => b[1] - a[1]);
+      add(
+        "languages",
+        languages.map(([name]) => name).join(", ") || "none",
+        languages.map(([name, count]) => `${name}: ${count} file(s)`).join("\n") ||
+          "No language was recognised in this project."
+      );
+      add("uncommitted changes", health.uncommitted_changes ?? "not a git repo", "Changed source files git knows about but the index does not.");
+      add(
+        "HEAD moved since index",
+        health.head_moved_since_index === null ? "unknown" : String(health.head_moved_since_index),
+        "A clean tree can still be stale: committing and switching branch leaves no dirty files."
+      );
+      add("database", `${(health.db_size_bytes / 1048576).toFixed(1)} MB`, health.db_path || "");
     }
     dom.resultList.replaceChildren();
     dom.resultsEmpty.hidden = true;
@@ -1036,4 +1204,86 @@ function activateTab(name) {
 
 document.querySelectorAll(".tab").forEach((tab) => {
   tab.addEventListener("click", () => activateTab(tab.dataset.tab));
+});
+
+/* ---------- tooltips ---------- */
+
+/* One floating element for the whole page, driven by `data-tip`. Native
+ * title= is unusable here: it takes a second to appear, cannot be styled, and
+ * silently truncates the multi-line explanations the status bar needs. */
+
+const TIP_DELAY_MS = 260;
+let tipTimer = null;
+let tipTarget = null;
+
+function tipText(element) {
+  const text = element.dataset.tip;
+  return text && text.trim() ? text : null;
+}
+
+function placeTip(element) {
+  const tip = dom.tip;
+  const box = element.getBoundingClientRect();
+  const size = tip.getBoundingClientRect();
+  const margin = 8;
+
+  let left = box.left + box.width / 2 - size.width / 2;
+  left = Math.max(margin, Math.min(left, window.innerWidth - size.width - margin));
+
+  // Prefer below; flip above when the element sits near the bottom edge
+  // (the status bar, where most of these live).
+  let top = box.bottom + 6;
+  if (top + size.height > window.innerHeight - margin) top = box.top - size.height - 6;
+  tip.style.left = `${Math.round(left)}px`;
+  tip.style.top = `${Math.round(Math.max(margin, top))}px`;
+}
+
+function showTip(element) {
+  const text = tipText(element);
+  if (!text) return;
+  tipTarget = element;
+  dom.tip.replaceChildren(
+    ...text.split("\n").map((line, index) => node("span", index === 0 ? null : "tip-sub", line))
+  );
+  dom.tip.hidden = false;
+  placeTip(element);
+  requestAnimationFrame(() => dom.tip.classList.add("shown"));
+}
+
+function hideTip() {
+  clearTimeout(tipTimer);
+  tipTarget = null;
+  dom.tip.classList.remove("shown");
+  dom.tip.hidden = true;
+}
+
+function scheduleTip(element) {
+  clearTimeout(tipTimer);
+  tipTimer = setTimeout(() => showTip(element), TIP_DELAY_MS);
+}
+
+document.addEventListener("pointerover", (event) => {
+  const element = event.target.closest?.("[data-tip]");
+  if (!element || element === tipTarget) return;
+  hideTip();
+  scheduleTip(element);
+});
+
+document.addEventListener("pointerout", (event) => {
+  const element = event.target.closest?.("[data-tip]");
+  if (element && element === tipTarget) hideTip();
+  else if (element) clearTimeout(tipTimer);
+});
+
+document.addEventListener("focusin", (event) => {
+  const element = event.target.closest?.("[data-tip]");
+  if (element) showTip(element);
+});
+
+document.addEventListener("focusout", hideTip);
+document.addEventListener("pointerdown", hideTip);
+window.addEventListener("scroll", hideTip, true);
+window.addEventListener("blur", hideTip);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") hideTip();
 });

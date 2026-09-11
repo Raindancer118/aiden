@@ -19,7 +19,30 @@ from serena.tools import (
 from serena.tools.tools_base import ToolMarkerOptional
 from serena.util.ls_diagnostics import GroupedDiagnostics
 from serena.util.text_utils import find_text_coordinates
+from solidlsp.ls_config import Language
 from solidlsp.ls_types import SymbolKind
+
+
+def _unanalysable_file_message(relative_path: str, active_languages: Sequence[Language]) -> str:
+    """Say *why* a file cannot be read, and what would fix it.
+
+    "Active languages: ['typescript']" on a .java file is a configuration problem, but
+    it reads like a capability limit, so name the missing language explicitly.
+    """
+    active = [lang.value for lang in active_languages]
+    filename = os.path.basename(relative_path)
+    candidates = [
+        lang.value
+        for lang in Language.iter_all(include_experimental=True)
+        if lang.is_programming_language() and lang.get_source_fn_matcher().is_relevant_filename(filename) and lang not in active_languages
+    ]
+    message = f"Cannot extract symbols from file {relative_path}. Active languages: {active}"
+    if candidates:
+        message += (
+            f". This file is handled by the language server(s) {sorted(set(candidates))}, which this project does not enable. "
+            f"Add it to 'languages' in the project's .serena/project.yml and reactivate the project."
+        )
+    return message
 
 
 class RestartLanguageServerTool(Tool, ToolMarkerOptional):
@@ -98,9 +121,7 @@ class GetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead):
         if os.path.isdir(file_path):
             raise ValueError(f"Expected a file path, but got a directory path: {relative_path}. ")
         if not symbol_retriever.can_analyze_file(relative_path):
-            raise ValueError(
-                f"Cannot extract symbols from file {relative_path}. Active languages: {[l.value for l in self.agent.get_active_lsp_languages()]}"
-            )
+            raise ValueError(_unanalysable_file_message(relative_path, self.agent.get_active_lsp_languages()))
 
         symbols = symbol_retriever.get_symbol_overview(relative_path)[relative_path]
 

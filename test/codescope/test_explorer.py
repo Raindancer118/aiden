@@ -302,3 +302,69 @@ def test_the_page_carries_the_token_so_the_browser_can_use_it(client) -> None:  
     body = http.get("/").get_data(as_text=True)
     assert explorer.explorer_token() in body
     assert "__CODESCOPE_TOKEN__" not in body
+
+
+# -- live state, idempotent actions ------------------------------------------
+
+
+def test_status_carries_live_progress_and_watcher_state(client) -> None:  # type: ignore[no-untyped-def]
+    http, _registry, project_id = client
+    body = http.get(f"/api/projects/{project_id}/status").get_json()
+
+    assert "progress" in body
+    assert body["watcher"]["running"] is False
+    assert body["running_actions"] == []
+
+
+def test_progress_endpoint_reports_the_last_run(client, project: Path) -> None:  # type: ignore[no-untyped-def]
+    http, _registry, project_id = client
+    body = http.get(f"/api/projects/{project_id}/progress").get_json()
+
+    assert body["progress"] is not None, "the fixture's reindex should still be on record"
+    assert body["progress"]["phase"] == "done"
+
+
+def test_starting_a_watcher_twice_does_not_start_a_second_one(client, project: Path) -> None:  # type: ignore[no-untyped-def]
+    pytest.importorskip("watchfiles")
+    http, _registry, project_id = client
+    from codescope.index.watcher import stop_watcher, watcher_status
+
+    try:
+        first = http.post(f"/api/projects/{project_id}/actions/watch_start")
+        assert first.status_code == 200
+        _wait_for(lambda: watcher_status(project).get("running") is True)
+
+        second = http.post(f"/api/projects/{project_id}/actions/watch_start")
+        assert second.status_code == 409
+        assert "already" in second.get_json()["detail"]
+        assert second.get_json()["status"] == "skipped"
+    finally:
+        stop_watcher(project)
+
+
+def test_stopping_a_watcher_that_never_ran_says_so(client, project: Path) -> None:  # type: ignore[no-untyped-def]
+    assert explorer._action_watch_stop(str(project), {}) == "no watcher was running"
+
+
+def test_a_second_reindex_is_refused_while_one_is_running(client, project: Path) -> None:  # type: ignore[no-untyped-def]
+    http, _registry, project_id = client
+    with explorer._INFLIGHT_LOCK:
+        explorer._INFLIGHT.setdefault(project_id, set()).add("reindex")
+    try:
+        response = http.post(f"/api/projects/{project_id}/actions/sync")
+        assert response.status_code == 409
+        assert "reindex is already running" in response.get_json()["detail"]
+    finally:
+        with explorer._INFLIGHT_LOCK:
+            explorer._INFLIGHT[project_id].discard("reindex")
+
+
+def _wait_for(predicate, timeout_s: float = 5.0) -> None:  # type: ignore[no-untyped-def]
+    import time
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if predicate():
+            return
+        time.sleep(0.05)
+    raise AssertionError("condition not met in time")

@@ -428,7 +428,17 @@ def build_app(registry: ProjectRegistry):  # type: ignore[no-untyped-def]
         project, error = _project_or_404(project_id)
         if error:
             return error
-        return jsonify(Indexer(project.root).health())
+        health = Indexer(project.root).health()
+        health.update(_live_state(project))  # adds the in-flight action list
+        return jsonify(health)
+
+    @app.get("/api/projects/<project_id>/progress")
+    def project_progress(project_id: str):  # type: ignore[no-untyped-def]
+        """Just the moving parts, cheap enough to poll once a second."""
+        project, error = _project_or_404(project_id)
+        if error:
+            return error
+        return jsonify(_live_state(project))
 
     # -- search ---------------------------------------------------------
 
@@ -490,7 +500,19 @@ def build_app(registry: ProjectRegistry):  # type: ignore[no-untyped-def]
         if action not in ACTIONS:
             return jsonify({"error": f"Unknown action {action!r}", "available": sorted(ACTIONS)}), 400
         payload = request.get_json(silent=True) or {}
+
+        # A second click must not start a second worker. Indexing the same
+        # project twice in parallel means two writers on one SQLite file and
+        # twice the CPU for the same result; a second watcher would be a
+        # second thread reindexing every change.
+        busy = _already_busy(project, action)
+        if busy is not None:
+            event = registry.actions.add(project.name, action, "skipped", busy)
+            return jsonify(asdict(event)), 409
+
         event = registry.actions.add(project.name, action, "running", "started")
+        with _INFLIGHT_LOCK:
+            _INFLIGHT.setdefault(project.id, set()).add(action)
 
         def worker() -> None:
             try:
@@ -499,6 +521,9 @@ def build_app(registry: ProjectRegistry):  # type: ignore[no-untyped-def]
             except Exception as e:
                 log.warning("Explorer action %s failed for %s: %s", action, project.name, e)
                 registry.actions.update(event.id, "failed", str(e)[:300])
+            finally:
+                with _INFLIGHT_LOCK:
+                    _INFLIGHT.get(project.id, set()).discard(action)
 
         threading.Thread(target=worker, name=f"codescope-action:{action}", daemon=True).start()
         return jsonify(asdict(event))
@@ -579,6 +604,42 @@ def build_app(registry: ProjectRegistry):  # type: ignore[no-untyped-def]
 # on purpose.
 
 
+#: project id -> actions currently being executed by this server.
+_INFLIGHT: dict[str, set[str]] = {}
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def _live_state(project: "RegisteredProject") -> dict:
+    """What is happening to this project's index right now."""
+    from codescope.index import progress
+    from codescope.index.watcher import watcher_status
+
+    with _INFLIGHT_LOCK:
+        running = sorted(_INFLIGHT.get(project.id, set()))
+    return {
+        "progress": progress.snapshot(project.root),
+        "watcher": watcher_status(project.root),
+        "running_actions": running,
+    }
+
+
+def _already_busy(project: "RegisteredProject", action: str) -> str | None:
+    """Why ``action`` must not be started again, or None if it may run."""
+    from codescope.index.watcher import watcher_status
+
+    with _INFLIGHT_LOCK:
+        if action in _INFLIGHT.get(project.id, set()):
+            return f"{action} is already running for this project"
+    if action == "watch_start" and watcher_status(project.root).get("running"):
+        return "a watcher is already running for this project"
+    if action in ("reindex", "sync"):
+        with _INFLIGHT_LOCK:
+            other = _INFLIGHT.get(project.id, set()) & {"reindex", "sync"}
+        if other:
+            return f"{sorted(other)[0]} is already running for this project"
+    return None
+
+
 def _action_reindex(root: str, payload: dict) -> str:
     from codescope.index.indexer import Indexer
 
@@ -595,15 +656,19 @@ def _action_sync(root: str, _payload: dict) -> str:
 
 
 def _action_watch_start(root: str, _payload: dict) -> str:
-    from codescope.index.watcher import start_watcher
+    from codescope.index.watcher import start_watcher, watcher_status
 
+    if watcher_status(root).get("running"):
+        return "watcher already running"
     status = start_watcher(root)
     return "watcher running" if status.get("running") else f"watcher did not start: {status.get('error')}"
 
 
 def _action_watch_stop(root: str, _payload: dict) -> str:
-    from codescope.index.watcher import stop_watcher
+    from codescope.index.watcher import stop_watcher, watcher_status
 
+    if not watcher_status(root).get("running"):
+        return "no watcher was running"
     stop_watcher(root)
     return "watcher stopped"
 
