@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIDEN Explorer</title>
+<meta name="aiden-token" content="__AIDEN_TOKEN__">
+<link rel="stylesheet" href="app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='11' fill='none' stroke='%235b8dd9' stroke-width='3'/><circle cx='16' cy='16' r='3' fill='%235b8dd9'/></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+      <circle cx="16" cy="16" r="11" fill="none" stroke="currentColor" stroke-width="2.5"/>
+      <circle cx="16" cy="16" r="3.2" fill="currentColor"/>
+      <path d="M16 5v4M16 23v4M5 16h4M23 16h4" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+    </svg>
+    <span>AIDEN</span>
+  </div>
+
+  <label class="project-picker">
+    <span class="sr-only">Project</span>
+    <select id="project-select" data-tip="Switch between the projects this AIDEN server knows about."></select>
+  </label>
+
+  <div class="search">
+    <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="6" fill="none" stroke="currentColor" stroke-width="2"/><path d="M13.5 13.5 18 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    <input id="search-input" type="search" placeholder="Search this codebase by meaning or name…" autocomplete="off" spellcheck="false"
+           data-tip="Hybrid search: plain words match by meaning, identifiers match by name. Press / to focus.">
+    <kbd>/</kbd>
+  </div>
+
+  <label class="toggle" data-tip="Skip symbols defined in test files, so results show the implementation rather than its tests.">
+    <input type="checkbox" id="exclude-tests"><span>Hide tests</span>
+  </label>
+
+  <div class="actions" role="group" aria-label="Index actions">
+    <button class="ghost-button" data-action="sync" type="button" data-tip="Reindex only the files git reports as changed. Fast; the usual way to catch up.">Sync</button>
+    <button class="ghost-button" data-action="reindex" type="button" data-tip="Walk the whole project and reindex it. Unchanged files are skipped, so this is safe to run any time.">Reindex</button>
+    <button class="ghost-button" data-action="watch_start" id="watch-toggle" type="button" aria-pressed="false"
+            data-tip="Keep the index fresh in the background: every saved file is reindexed automatically.">Watch</button>
+  </div>
+
+  <button class="project-count" id="project-count" type="button" data-tip="Every project attached to this AIDEN server. Click to switch or add one.">
+    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 5.5A1.5 1.5 0 0 1 4 4h3.4l1.4 1.8H16a1.5 1.5 0 0 1 1.5 1.5v7.2A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+    <b id="project-count-value">–</b>
+    <span class="project-count-label">open</span>
+  </button>
+
+  <button class="icon-button" id="theme-toggle" type="button" data-tip="Switch between the dark and light theme." aria-label="Switch theme">
+    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5a7.5 7.5 0 1 0 7.5 7.5A6 6 0 0 1 10 2.5Z" fill="currentColor"/></svg>
+  </button>
+
+  <button class="icon-button danger" id="shutdown" type="button" data-tip="Shut down every attached AIDEN instance and this server. Nothing is deleted; the index stays on disk." aria-label="Shut down AIDEN">
+    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M6 5.5a6 6 0 1 0 8 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+  </button>
+</header>
+
+<div class="action-toast" id="action-toast" hidden></div>
+
+<dialog class="projects-dialog" id="projects-dialog" aria-label="Projects">
+  <header>
+    <h2>Projects</h2>
+    <button class="ghost-button" id="projects-browse" type="button">Add a folder…</button>
+    <button class="icon-button" id="projects-close" type="button" aria-label="Close">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+  </header>
+  <div id="projects-body"></div>
+</dialog>
+
+<main class="layout">
+
+  <aside class="panel results" aria-label="Results">
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" data-tab="search" aria-selected="true" data-tip="Search results, or the most referenced symbols when the box is empty.">Search</button>
+      <button class="tab" role="tab" data-tab="files" aria-selected="false" data-tip="Browse the indexed files of this project.">Files</button>
+      <button class="tab" role="tab" data-tab="clones" aria-selected="false" data-tip="Near-duplicate code: blocks that already exist elsewhere in this project.">Clones</button>
+      <button class="tab" role="tab" data-tab="health" aria-selected="false" data-tip="What the index can and cannot answer right now, and what a run is currently doing.">Health</button>
+    </div>
+    <div class="panel-head">
+      <h2 id="results-title">Most referenced</h2>
+      <span class="count" id="results-count"></span>
+    </div>
+    <ol class="result-list" id="result-list"></ol>
+    <p class="empty" id="results-empty" hidden>Nothing matched. Try fewer words, or check the index status below.</p>
+  </aside>
+
+  <div class="resizer" data-resize="left" role="separator" aria-orientation="vertical" tabindex="0"
+       aria-label="Resize the results panel"></div>
+
+  <section class="panel graph" aria-label="Call graph">
+    <div class="panel-head">
+      <h2 id="graph-title">Call graph</h2>
+      <div class="graph-actions">
+        <span class="legend" id="legend-in" data-tip="Callers: symbols that call the selected one."><i class="dot in"></i>calls in</span>
+        <span class="legend" id="legend-out" data-tip="Callees: symbols the selected one calls."><i class="dot out"></i>calls out</span>
+        <div class="segmented" role="group" aria-label="Graph scope">
+          <button class="ghost-button" id="view-symbol" type="button" aria-pressed="true" data-tip="Show the callers and callees around one symbol.">Symbol</button>
+          <button class="ghost-button" id="view-project" type="button" aria-pressed="false" data-tip="Show how directories and modules in this project depend on each other.">Whole project</button>
+        </div>
+        <button class="ghost-button" id="graph-back" type="button" disabled data-tip="Go back to the previously focused symbol.">Back</button>
+      </div>
+    </div>
+    <div class="graph-canvas" id="graph-canvas">
+      <p class="empty centered">Pick a symbol to see what calls it and what it calls.</p>
+    </div>
+    <p class="note" id="graph-note" hidden></p>
+  </section>
+
+  <div class="resizer" data-resize="right" role="separator" aria-orientation="vertical" tabindex="0"
+       aria-label="Resize the detail panel"></div>
+
+  <aside class="panel detail" aria-label="Symbol detail">
+    <div class="panel-head">
+      <h2 id="detail-title">Details</h2>
+      <span class="count" id="detail-kind"></span>
+    </div>
+    <div id="detail-body">
+      <p class="empty">Select a symbol.</p>
+    </div>
+  </aside>
+
+</main>
+
+<footer class="statusbar" id="statusbar">
+  <span class="status-item" id="status-index" data-tip="Files and symbols currently in this project's index.">…</span>
+  <span class="status-item" id="status-embed"></span>
+  <span class="status-item progress-item" id="status-progress" hidden>
+    <span class="progress-bar"><i id="progress-fill"></i></span>
+    <span id="progress-label"></span>
+  </span>
+  <span class="status-item" id="status-watch" hidden data-tip="A background watcher is reindexing files as you save them.">
+    <span class="status-dot live"></span><span id="status-watch-label">watching</span>
+  </span>
+  <span class="status-item" id="status-advice"></span>
+  <span class="spacer"></span>
+  <span class="status-item muted" id="status-projects"></span>
+</footer>
+
+<div class="tip" id="tip" role="tooltip" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

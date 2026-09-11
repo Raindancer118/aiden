@@ -2,6 +2,41 @@
 
 Status of the `main` branch. Changes prior to the next official version change will appear here.
 
+## 0.4.0 — 2026-09-11
+
+Renamed from Volantic Codescope to **AIDEN** (*Agent Intelligence for
+Development, Exploration & Navigation*). The Python package is `aiden`, the
+entrypoint is `aiden`, environment variables are `AIDEN_*`, and the per-project
+index lives at `.serena/aiden/index.db`. An index built under the old name is
+moved there automatically on first use, so nothing is re-indexed. The MCP
+server has to be re-registered under the new command.
+
+### Fixed
+- `activate_project` raised `KeyError: 'languages'` for any `project.yml` that
+  spells the field `language_servers` (as newer Serena releases do) or omits it
+  entirely. Both spellings are now accepted, and a configuration that names no
+  language is repaired from the languages actually present in the repository.
+- Project autogeneration enabled only the single most common language, so a
+  Java backend with a TypeScript frontend answered
+  `Cannot extract symbols ... Active languages: ['typescript']` for half the
+  repository. Every language with at least a 10% share of the source files is
+  now enabled, capped at four language servers.
+- That error message now names the language server the file needs and where to
+  enable it, instead of only listing what is active.
+- `hidden` elements in the explorer could still be visible, because the panel
+  classes set `display`.
+
+### Added
+- Index runs publish live progress (phase, counts, ETA). The explorer shows a
+  progress bar while indexing, `index_status` reports the current run, and the
+  Health tab lists the run, the watcher and the language breakdown.
+- Hover tooltips throughout the explorer.
+
+### Changed
+- Watch is a toggle: pressing it again stops the watcher instead of starting a
+  second one. A reindex or sync cannot be started on top of a running one; the
+  UI says so rather than claiming it started.
+
 * Codescope index & search:
   - Embedding models are memoized per process. Every semantic search previously
     reconstructed the ONNX model (~2.7 s and ~0.9 GB on the default code model)

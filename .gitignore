@@ -277,10 +277,14 @@ vue-implementation/
 
 news/news.json
 
-# --- Volantic Codescope ---
+# --- AIDEN ---
 # Self-notes for the agent; intentionally not committed.
 Project.md
-# Codescope index artifacts (per-project SQLite index lives under .serena/codescope/)
+# AIDEN index artifacts (per-project SQLite index lives under .serena/aiden/)
+**/.serena/aiden/
+*.aiden.db
+*.aiden.db-*
+# the pre-rename location, kept ignored until every checkout has been adopted
 **/.serena/codescope/
 *.codescope.db
 *.codescope.db-*

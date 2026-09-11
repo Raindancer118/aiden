@@ -14,10 +14,10 @@ from sensai.util.logging import configure
 
 # Must run before any test module is collected: ToolRegistry (serena.tools.tools_base)
 # is a process-wide singleton, and test_mcp.py's parametrize decorator instantiates it
-# at collection time. In production, codescope.cli always registers Codescope's tools
+# at collection time. In production, aiden.cli always registers AIDEN's tools
 # before Serena touches the registry; mirror that ordering here so the singleton isn't
 # frozen without them for the rest of the test session.
-from codescope.cli import register_codescope_tools
+from aiden.cli import register_aiden_tools
 from serena.config.serena_config import SerenaConfig, SerenaPaths
 from serena.constants import SERENA_MANAGED_DIR_NAME
 from serena.project import Project
@@ -28,7 +28,7 @@ from solidlsp.settings import SolidLSPSettings
 
 from .solidlsp.clojure import is_clojure_cli_available
 
-register_codescope_tools()
+register_aiden_tools()
 
 configure(level=logging.INFO)
 

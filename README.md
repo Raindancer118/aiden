@@ -1,6 +1,8 @@
-# Volantic Codescope
+# AIDEN
 
-**An all-in-one codebase-intelligence MCP server.** Codescope gives a coding
+*Agent Intelligence for Development, Exploration & Navigation*
+
+**An all-in-one codebase-intelligence MCP server.** AIDEN gives a coding
 agent everything it needs to work on a whole codebase — understand it, search
 it, navigate it, edit it structurally, and run the development loop — through a
 single Model Context Protocol server.
@@ -11,7 +13,7 @@ It is built as a private fork of [Serena](https://github.com/oraios/serena)
 
 | Layer | What it adds | Tools |
 |-------|--------------|-------|
-| **Persistent index** | tree-sitter symbol extraction (33 languages) into a single SQLite database; incremental, gitignore-aware | `reindex`, `index_status`, `codescope index` (CLI) |
+| **Persistent index** | tree-sitter symbol extraction (33 languages) into a single SQLite database; incremental, gitignore-aware | `reindex`, `index_status`, `aiden index` (CLI) |
 | **Hybrid search** | exact-name + BM25 (FTS5) + **local semantic vectors** (sqlite-vec) + trigram, fused with Reciprocal Rank Fusion; path/language/kind/test filters; every hit carries a folded code preview | `search_code`, `search_semantic`, `search_regex` |
 | **One-call context** | code, callers, callees and the tests exercising it, in a single budgeted answer | `get_code_context` |
 | **Code graphs** | dependencies, dependents, call chains, change-impact (blast radius), project map, file summaries | `get_dependencies`, `get_dependents`, `get_call_chain`, `get_change_impact`, `get_project_map`, `get_file_summary` |
@@ -19,7 +21,7 @@ It is built as a private fork of [Serena](https://github.com/oraios/serena)
 | **Reuse & clones** | "does this already exist?" before writing; semantic clone clusters; a pre-commit duplication gate | `find_similar_code`, `find_duplicate_code`, `detect_clones_in_diff` |
 | **Live indexing** | git-scoped fast sync + a debounced background file watcher | `sync_index`, `watch_start`, `watch_stop`, `watch_status` |
 | **Dev-ops** | auto-detecting test runner, project scaffolding, GitHub (via `gh`), git commit/diff/changelog | `run_tests`, `detect_test_framework`, `create_project`, `git_status`, `git_diff`, `git_commit`, `generate_changelog`, `github_*` |
-| **Explorer (web UI)** | one shared local page for every project Codescope runs in: hybrid search, call graph, whole-project dependency graph, file tree, clone clusters, index health, and index actions | `codescope index explorer`, auto-started with the MCP server |
+| **Explorer (web UI)** | one shared local page for every project AIDEN runs in: hybrid search, call graph, whole-project dependency graph, file tree, clone clusters, index health, and index actions | `aiden index explorer`, auto-started with the MCP server |
 | **Durable memory** | mandatory Diary MCP backend with project auto-registration; no local Markdown fallback | `memory_context`, `memory_project_context`, `memory_get`, `memory_tree`, `memory_search*`, `memory_upsert`, `memory_delete` |
 
 Plus the full Serena toolset (`find_symbol`, `find_referencing_symbols`,
@@ -29,29 +31,29 @@ Plus the full Serena toolset (`find_symbol`, `find_referencing_symbols`,
 ## Why it's strong
 
 - **LSP accuracy *and* a persistent hybrid index in one server.** Serena gives
-  precise, type-aware symbol resolution; Codescope adds fast lexical + semantic
+  precise, type-aware symbol resolution; AIDEN adds fast lexical + semantic
   retrieval and structural graphs over a persistent index. Neither half exists
   in the other open-source code-index MCPs alone.
 - **Local-first.** Semantic embeddings run locally (code-aware ONNX model via
   `fastembed`) — no API key, nothing leaves the machine. An optional Gemini
   backend is available for the highest retrieval quality.
-- **One durable memory source.** Codescope maintains a persistent MCP session
+- **One durable memory source.** AIDEN maintains a persistent MCP session
   to Diary and uses only Diary's public tools. It never reads or writes the
   Diary database directly and never falls back to `.serena/memories`.
-- **Mergeable fork.** Almost all Codescope value lives in `src/codescope/`.
+- **Mergeable fork.** Almost all AIDEN value lives in `src/aiden/`.
   Two deliberately small Serena hooks support tool exclusion and the Diary
   activation hint; they keep upstream merges reviewable.
 
 ## Install
 
 ```bash
-uv sync                       # installs Codescope + Serena + the index stack
-uv run codescope start-mcp-server
+uv sync                       # installs AIDEN + Serena + the index stack
+uv run aiden start-mcp-server
 ```
 
 Diary must be installed as the `diary-mcp-local` executable. Override its safe,
-argument-aware launch command with `CODESCOPE_DIARY_COMMAND`; adjust the
-per-call timeout with `CODESCOPE_DIARY_TIMEOUT_SECONDS`. If Diary is unavailable,
+argument-aware launch command with `AIDEN_DIARY_COMMAND`; adjust the
+per-call timeout with `AIDEN_DIARY_TIMEOUT_SECONDS`. If Diary is unavailable,
 memory tools fail explicitly—there is no local fallback.
 
 ### Indexing
@@ -64,31 +66,31 @@ For a large repository, run the first index from the shell instead of inside
 the MCP server, where you can give it a budget:
 
 ```bash
-codescope index build --project . -v
+aiden index build --project . -v
 # under a hard memory cap, at low priority:
 systemd-run --user --scope -p MemoryMax=2G -p CPUWeight=20 \
-    nice -n 19 ionice -c3 codescope index build --project .
+    nice -n 19 ionice -c3 aiden index build --project .
 ```
 
 Vectors are written batch by batch, so an interrupted run keeps everything it
 had already embedded and `build` resumes with what is still missing.
-`codescope index sync|status|search` cover the rest.
+`aiden index sync|status|search` cover the rest.
 
 Tuning (all optional):
 
 | Variable | Meaning |
 |----------|---------|
-| `CODESCOPE_EMBED_MODEL` | fastembed model id. The default is code-aware and 768-dimensional; a smaller general model trades retrieval quality for a much faster, lighter index. |
-| `CODESCOPE_EMBED_BATCH_COST` | memory budget per forward pass, as `item count x longest item^2` in char² (default 20000000). This is the dial for peak memory: ONNX pads every item to the longest one in the batch, and attention is quadratic in that length. Batches run longest-first, so this budget sets the high-water mark on the very first batch and the rest of the run reuses it. Raise it for throughput, lower it for a smaller footprint. |
-| `CODESCOPE_EMBED_BATCH` | hard cap on documents per forward pass (default 128); the character budget above usually binds first. |
-| `CODESCOPE_EMBED_THREADS` | ONNX thread count. Unset means "all cores". |
+| `AIDEN_EMBED_MODEL` | fastembed model id. The default is code-aware and 768-dimensional; a smaller general model trades retrieval quality for a much faster, lighter index. |
+| `AIDEN_EMBED_BATCH_COST` | memory budget per forward pass, as `item count x longest item^2` in char² (default 20000000). This is the dial for peak memory: ONNX pads every item to the longest one in the batch, and attention is quadratic in that length. Batches run longest-first, so this budget sets the high-water mark on the very first batch and the rest of the run reuses it. Raise it for throughput, lower it for a smaller footprint. |
+| `AIDEN_EMBED_BATCH` | hard cap on documents per forward pass (default 128); the character budget above usually binds first. |
+| `AIDEN_EMBED_THREADS` | ONNX thread count. Unset means "all cores". |
 
 ## The explorer
 
 Activating a project starts a local web UI on <http://127.0.0.1:24256> and
-opens it once. A second Codescope instance does not start a second server: it
+opens it once. A second AIDEN instance does not start a second server: it
 registers its project with the one already running, and the open page picks it
-up. `CODESCOPE_EXPLORER=0` turns the whole thing off; `codescope index explorer`
+up. `AIDEN_EXPLORER=0` turns the whole thing off; `aiden index explorer`
 starts it by hand.
 
 What it shows, per project:
@@ -108,20 +110,20 @@ Loopback is not treated as a boundary. Any local process can connect to it,
 and a page you visit can point a hostname at 127.0.0.1, so: requests are
 rejected unless the `Host` is a loopback name (DNS rebinding), a foreign
 `Origin` is refused, every state-changing request needs the secret in
-`~/.codescope/token` (mode 0600, handed to the page in its own HTML where a
+`~/.aiden/token` (mode 0600, handed to the page in its own HTML where a
 cross-origin caller cannot read it), registration is confined to your home
 directory, and a process id registered over the API is verified to be a live
-Codescope process you own before it is ever signalled. When you run one, the agent is told with its next
+AIDEN process you own before it is ever signalled. When you run one, the agent is told with its next
 tool result — explicitly as a notification it does not have to act on.
 
-The counter in the header opens the list of every project Codescope has run
+The counter in the header opens the list of every project AIDEN has run
 in, running or not, and can attach one that is not. The power button stops
 every attached instance and the server.
 
 ## Use with Claude Code
 
 ```bash
-claude mcp add codescope -- uv run --directory "/path/to/codescope" codescope start-mcp-server
+claude mcp add aiden -- uv run --directory "/path/to/aiden" aiden start-mcp-server
 ```
 
 Or add to `.mcp.json`:
@@ -129,9 +131,9 @@ Or add to `.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "codescope": {
+    "aiden": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/codescope", "codescope", "start-mcp-server"]
+      "args": ["run", "--directory", "/path/to/aiden", "aiden", "start-mcp-server"]
     }
   }
 }
@@ -145,25 +147,27 @@ back to `search_code`, `get_call_hierarchy`, `get_change_impact`,
 ## Architecture
 
 ```
-codescope MCP (FastMCP, stdio)  —  Serena tool registry (extended at runtime)
+aiden MCP (FastMCP, stdio)  —  Serena tool registry (extended at runtime)
   |- A  LSP / semantics        (serena + solidlsp; two small integration hooks)
-  |- B  Hybrid index           (src/codescope/index: parser, store, embed, search, graph, incremental, watcher)
-  |- C  Dev-ops                (src/codescope/devops: testrunner, scaffold, github, vcs)
+  |- B  Hybrid index           (src/aiden/index: parser, store, embed, search, graph, incremental, watcher)
+  |- C  Dev-ops                (src/aiden/devops: testrunner, scaffold, github, vcs)
   '- D  Durable memory         (persistent MCP client -> Diary; no local storage)
 ```
 
-The per-project index lives at `.serena/codescope/index.db`.
+The per-project index lives at `.serena/aiden/index.db`. A project last
+indexed under the old name is adopted automatically: the database is moved
+from `.serena/codescope/index.db` on first use, so nothing is re-indexed.
 
 ## Development
 
 ```bash
-uv run --with pytest pytest test/codescope -o addopts="" -p no:cacheprovider
-uv run --with ruff ruff check src/codescope test/codescope
+uv run --with pytest pytest test/aiden -o addopts="" -p no:cacheprovider
+uv run --with ruff ruff check src/aiden test/aiden
 ```
 
 ## Credits & license
 
 Built on [Serena](https://github.com/oraios/serena) (MIT). Symbol-extraction
-queries under `src/codescope/index/queries/` are vendored from
+queries under `src/aiden/index/queries/` are vendored from
 [Aider](https://github.com/Aider-AI/aider) (Apache-2.0); see the `NOTICE.md`
 there. This project retains Serena's MIT license (see `LICENSE`).

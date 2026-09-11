@@ -3,9 +3,9 @@ build-backend = "hatchling.build"
 requires = ["hatchling"]
 
 [project]
-name = "volantic-codescope"
-version = "0.3.2"
-description = "Volantic Codescope - an all-in-one codebase-intelligence MCP: LSP-accurate navigation & editing (via Serena) plus a persistent hybrid index (tree-sitter + SQLite FTS5/BM25 + vectors + trigram), code graphs, and dev-ops (test runner, scaffolding, GitHub)."
+name = "aiden"
+version = "0.4.0"
+description = "AIDEN - an all-in-one codebase-intelligence MCP: LSP-accurate navigation & editing (via Serena) plus a persistent hybrid index (tree-sitter + SQLite FTS5/BM25 + vectors + trigram), code graphs, and dev-ops (test runner, scaffolding, GitHub)."
 authors = [{ name = "Tom Stieh (Raindancer118)", email = "tom560stieh@gmail.com" }]
 readme = "README.md"
 requires-python = ">=3.11, <3.15"
@@ -53,7 +53,7 @@ dependencies = [
   "regex==2026.2.28",
   "pythonnet==3.1.0 ; sys_platform == 'win32'",
   "oslex==2.0.0",
-  # --- Volantic Codescope additions: hybrid index engine + dev-ops ---
+  # --- AIDEN additions: hybrid index engine + dev-ops ---
   "tree-sitter>=0.25,<0.26",          # QueryCursor API (>=0.23)
   "tree-sitter-language-pack==1.8.1", # ~305 grammars in one dependency
   "sqlite-vec==0.1.9",                # local vector search (pre-v1: pinned exactly)
@@ -73,7 +73,7 @@ publish-url = "https://test.pypi.org/legacy/"
 explicit = true
 
 [project.scripts]
-codescope = "codescope.cli:main"
+aiden = "aiden.cli:main"
 serena = "serena.cli:top_level"
 serena-agent = "serena.cli:top_level"
 serena-hooks = "serena.hooks:hook_commands"
@@ -117,7 +117,7 @@ Homepage = "https://github.com/Raindancer118/volantic-codescope"
 Upstream = "https://github.com/oraios/serena"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/codescope", "src/serena", "src/interprompt", "src/solidlsp"]
+packages = ["src/aiden", "src/serena", "src/interprompt", "src/solidlsp"]
 
 [tool.doc8]
 max-line-length = 1000
@@ -167,7 +167,7 @@ _ruff_fix = "ruff check --fix src scripts test"
 _ruff_format = "ruff format src scripts test"
 lint = ["_ruff_format_check", "_ruff_check"]
 format = ["_ruff_fix", "_ruff_format"]
-_mypy_core = "mypy src/serena src/solidlsp src/codescope"
+_mypy_core = "mypy src/serena src/solidlsp src/aiden"
 _mypy_test = "mypy --disable-error-code no-untyped-def test"
 type-check = ["_mypy_core", "_mypy_test"]
 # docs
