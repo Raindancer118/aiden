@@ -113,7 +113,7 @@ agno = ["agno==2.5.10", "sqlalchemy==2.0.41"]  # agno bumped for session state o
 google = ["google-genai==1.27.0"]
 
 [project.urls]
-Homepage = "https://github.com/Raindancer118/volantic-codescope"
+Homepage = "https://github.com/Raindancer118/aiden"
 Upstream = "https://github.com/oraios/serena"
 
 [tool.hatch.build.targets.wheel]
