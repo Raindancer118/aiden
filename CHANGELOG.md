@@ -2,7 +2,7 @@
 
 Status of the `main` branch. Changes prior to the next official version change will appear here.
 
-## 0.4.0 — 2026-09-11
+## 0.4.1 — 2026-09-11
 
 Renamed from Volantic Codescope to **AIDEN** (*Agent Intelligence for
 Development, Exploration & Navigation*). The Python package is `aiden`, the
