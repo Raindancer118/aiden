@@ -11,6 +11,14 @@ const state = {
   view: "symbol",       // symbol | project
   history: [],
   searchToken: 0,
+  tab: "search",
+  /* How to rebuild the left panel exactly as it stands now -- including a
+   * drilled-into file or a typed query -- so a live refresh does not throw the
+   * user back to the top of the tab. */
+  reload: null,
+  indexRevision: null,
+  pendingRevision: null,
+  refreshing: false,
 };
 
 const el = (id) => document.getElementById(id);
@@ -115,6 +123,8 @@ async function selectProject(projectId) {
   state.projectId = projectId;
   state.focus = null;
   state.history = [];
+  state.indexRevision = null;
+  state.pendingRevision = null;
   dom.graphBack.disabled = true;
   dom.search.value = "";
   clearGraph("Pick a symbol to see what calls it and what it calls.");
@@ -256,16 +266,78 @@ function renderWatcher(watcher, runningActions) {
 
 async function loadLiveState() {
   if (!state.projectId) return;
+  let live;
   try {
-    renderLiveState(await api(projectPath("progress")));
+    live = await api(projectPath("progress"));
   } catch {
-    /* the server may be shutting down; the next tick will tell us */
+    return; /* the server may be shutting down; the next tick will tell us */
+  }
+  renderLiveState(live);
+  noteIndexRevision(live);
+}
+
+/* ---------- keeping the panels live ---------- */
+
+/* The index changes under the page all the time: the watcher reindexes saved
+ * files, an agent calls reindex over MCP, another instance syncs. None of that
+ * went through this page, so nothing here used to notice -- the results,
+ * the graph and the detail pane kept showing whatever was true when they were
+ * last drawn. They now follow the index revision, which is a stat of the
+ * database and therefore catches every writer.
+ *
+ * A run in flight writes continuously, so a refresh waits until the revision
+ * has held still for a poll tick and no run is active. Otherwise a full
+ * reindex would redraw the panels once a second for several minutes. */
+
+function noteIndexRevision(live) {
+  const revision = live.index_revision;
+  if (revision === null || revision === undefined) return;
+
+  if (state.indexRevision === null) {
+    state.indexRevision = revision;
+    return;
+  }
+  if (revision === state.indexRevision) {
+    state.pendingRevision = null;
+    return;
+  }
+  if (live.progress && live.progress.running) {
+    state.pendingRevision = null; // settle once the run is over
+    return;
+  }
+  if (state.pendingRevision !== revision) {
+    state.pendingRevision = revision; // seen once; confirm on the next tick
+    return;
+  }
+  state.indexRevision = revision;
+  state.pendingRevision = null;
+  refreshPanels();
+}
+
+async function refreshPanels() {
+  if (state.refreshing) return;
+  state.refreshing = true;
+  const scrollTop = dom.resultList.scrollTop;
+  try {
+    await Promise.all([
+      state.reload ? state.reload() : loadOverview(),
+      state.focus ? focusSymbol(state.focus.name, state.focus.path) : Promise.resolve(),
+      loadStatus(),
+    ]);
+    dom.resultList.scrollTop = scrollTop;
+  } catch (error) {
+    /* A refresh nobody asked for must not replace the panel with an error;
+     * the next change will try again. */
+    console.warn("Live refresh failed:", error);
+  } finally {
+    state.refreshing = false;
   }
 }
 
 /* ---------- results ---------- */
 
 async function loadOverview() {
+  state.reload = loadOverview;
   const data = await api(projectPath("overview"));
   dom.resultsTitle.textContent = data.mode === "symbols" ? "Symbols" : "Most referenced";
   const rows = (data.busiest || []).map((entry) => ({
@@ -287,6 +359,7 @@ async function runSearch(query) {
     await loadOverview();
     return;
   }
+  state.reload = () => runSearch(query);
   const data = await api(projectPath("search"), {
     q: query,
     limit: 30,
@@ -753,8 +826,7 @@ async function pollEvents() {
     toast(`${event.action} on ${event.project}: ${event.detail}`, event.status);
     loadLiveState();
     if (event.status === "done" && event.action !== "watch_stop") {
-      loadStatus();
-      if (!dom.search.value.trim()) loadOverview();
+      refreshPanels();
     }
   }
 }
@@ -900,6 +972,7 @@ const tabs = {
 
   async files() {
     dom.search.disabled = true;
+    state.reload = tabs.files;
     const data = await api(projectPath("files"));
     dom.resultsTitle.textContent = "Files";
     setCrumbs(null);
@@ -917,6 +990,7 @@ const tabs = {
 
   async clones() {
     dom.search.disabled = true;
+    state.reload = tabs.clones;
     dom.resultsTitle.textContent = "Clones";
     setCrumbs(null);
     renderRows([], "Looking for duplicated code…");
@@ -942,6 +1016,7 @@ const tabs = {
 
   async health() {
     dom.search.disabled = true;
+    state.reload = tabs.health;
     dom.resultsTitle.textContent = "Health";
     setCrumbs(null);
     const health = await api(projectPath("status"));
@@ -1040,6 +1115,7 @@ function renderRows(rows, emptyMessage) {
 }
 
 async function openFile(path) {
+  state.reload = () => openFile(path);
   const data = await api(projectPath("files"), { path });
   dom.resultsTitle.textContent = path.split("/").pop();
   const crumbs = node("div", "crumbs");
@@ -1198,6 +1274,7 @@ document.getElementById("shutdown").addEventListener("click", async () => {
 /* ---------- tab wiring ---------- */
 
 function activateTab(name) {
+  state.tab = name;
   document.querySelectorAll(".tab").forEach((tab) => tab.setAttribute("aria-selected", String(tab.dataset.tab === name)));
   tabs[name]().catch((error) => renderRows([], `Could not load: ${error.message}`));
 }

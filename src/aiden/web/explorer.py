@@ -611,16 +611,11 @@ _INFLIGHT_LOCK = threading.Lock()
 
 def _live_state(project: "RegisteredProject") -> dict:
     """What is happening to this project's index right now."""
-    from aiden.index import progress
-    from aiden.index.watcher import watcher_status
+    from aiden.index.indexer import live_state
 
     with _INFLIGHT_LOCK:
         running = sorted(_INFLIGHT.get(project.id, set()))
-    return {
-        "progress": progress.snapshot(project.root),
-        "watcher": watcher_status(project.root),
-        "running_actions": running,
-    }
+    return {**live_state(project.root), "running_actions": running}
 
 
 def _already_busy(project: "RegisteredProject", action: str) -> str | None:

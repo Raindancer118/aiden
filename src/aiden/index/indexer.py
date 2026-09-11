@@ -90,6 +90,48 @@ def default_db_path(project_root: str | Path) -> Path:
     return Path(project_root) / INDEX_RELPATH
 
 
+def index_revision(db_path: str | Path) -> str | None:
+    """A cheap fingerprint that changes whenever the index is written.
+
+    Pollable without opening the database, so a UI can notice writes made by
+    anyone -- the watcher, an MCP tool call, another instance, the CLI --
+    rather than only the runs it started itself. The write-ahead log is part
+    of the fingerprint because a committed write can sit there for a while
+    before it reaches the main file.
+    """
+    db_path = Path(db_path)
+    parts: list[str] = []
+    for suffix in ("", "-wal"):
+        path = db_path.with_name(db_path.name + suffix)
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        parts.append(f"{st.st_size}:{st.st_mtime_ns}")
+    return "|".join(parts) or None
+
+
+def live_state(project_root: str | Path, db_path: str | Path | None = None) -> dict:
+    """What is happening to this index right now, in this process.
+
+    Progress and watcher state are per process: a run started by the MCP
+    server is visible to the MCP server, one started by the explorer to the
+    explorer. The index revision is not -- it is read from disk, so it also
+    catches writes made by someone else entirely.
+
+    Deliberately free of ``Indexer``: this is polled about once a second, and
+    constructing one re-reads and re-parses .gitignore every time.
+    """
+    from aiden.index.watcher import watcher_status
+
+    root = Path(project_root).resolve()
+    return {
+        "progress": progress.snapshot(root),
+        "watcher": watcher_status(root),
+        "index_revision": index_revision(db_path or default_db_path(root)),
+    }
+
+
 def adopt_legacy_index(project_root: str | Path) -> Path | None:
     """Move a pre-rename index to its new home, if one is there and nothing is here.
 
@@ -533,16 +575,8 @@ class Indexer:
             store.close()
 
     def live_state(self) -> dict:
-        """What is happening to this index right now, in this process.
-
-        Progress and watcher state are per process: a run started by the MCP
-        server is visible to the MCP server, one started by the explorer to the
-        explorer. Both are the process the caller is asking from, which is the
-        one whose answer matters.
-        """
-        from aiden.index.watcher import watcher_status
-
-        return {"progress": progress.snapshot(self.root), "watcher": watcher_status(self.root)}
+        """See :func:`live_state`."""
+        return live_state(self.root, self.db_path)
 
     def health(self) -> dict:
         """What the index can and cannot answer right now.

@@ -107,3 +107,36 @@ def test_nested_tracking_does_not_reset_the_outer_run(tmp_path: Path) -> None:
             assert inner is outer
         assert progress.snapshot(tmp_path)["done"] == 4  # type: ignore[index]
     assert progress.snapshot(tmp_path)["phase"] == "done"  # type: ignore[index]
+
+
+# -- noticing writes made by someone else ------------------------------------
+
+
+def test_index_revision_changes_when_the_index_is_written(tmp_path: Path) -> None:
+    """The page polls this to notice writes it did not make itself."""
+    from aiden.index.indexer import index_revision, live_state
+
+    _project(tmp_path)
+    indexer = Indexer(tmp_path)
+    assert index_revision(indexer.db_path) is None, "no index, no revision"
+
+    indexer.reindex(embedder=HashingEmbedder(dim=32))
+    first = index_revision(indexer.db_path)
+    assert first is not None
+    assert live_state(tmp_path)["index_revision"] == first
+
+    (tmp_path / "later.py").write_text("def later():\n    return 1\n", encoding="utf-8")
+    indexer.reindex_paths(["later.py"], embedder=HashingEmbedder(dim=32))
+
+    assert index_revision(indexer.db_path) != first
+
+
+def test_index_revision_is_stable_without_writes(tmp_path: Path) -> None:
+    """A stable revision is what stops the UI redrawing itself every second."""
+    from aiden.index.indexer import index_revision
+
+    _project(tmp_path)
+    indexer = Indexer(tmp_path)
+    indexer.reindex(embedder=HashingEmbedder(dim=32))
+
+    assert index_revision(indexer.db_path) == index_revision(indexer.db_path)

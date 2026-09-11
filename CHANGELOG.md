@@ -32,10 +32,22 @@ server has to be re-registered under the new command.
   Health tab lists the run, the watcher and the language breakdown.
 - Hover tooltips throughout the explorer.
 
+- A reindex died with `UNIQUE constraint failed on chunks_vec primary key`
+  whenever anything else wrote vectors while it ran. The set of symbols missing
+  a vector is a snapshot taken before a run that can take minutes, and the
+  watcher, a CLI sync or an agent calling reindex fills some of them in
+  meanwhile; vector writes now replace rather than insert.
+
 ### Changed
 - Watch is a toggle: pressing it again stops the watcher instead of starting a
   second one. A reindex or sync cannot be started on top of a running one; the
   UI says so rather than claiming it started.
+- The explorer panels follow the index live. Every writer -- the watcher, an
+  MCP tool call, another instance, the CLI -- bumps a revision the page polls,
+  and the results, call graph, detail pane and status bar redraw themselves
+  without losing the current query, the drilled-into file or the scroll
+  position.
+- The header spans the full window width instead of bunching up on the left.
 
 * Codescope index & search:
   - Embedding models are memoized per process. Every semantic search previously

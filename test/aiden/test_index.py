@@ -378,3 +378,29 @@ def test_adopting_is_a_no_op_without_a_legacy_index(tmp_path: Path) -> None:
     from aiden.index.indexer import adopt_legacy_index
 
     assert adopt_legacy_index(tmp_path) is None
+
+
+# -- concurrent writers -------------------------------------------------------
+
+
+def test_reembedding_a_symbol_replaces_its_vector(tmp_path: Path) -> None:
+    """Writing a vector for a symbol that already has one must not blow up.
+
+    The set of symbols missing a vector is a snapshot taken before a run that
+    can last minutes. Anything else writing meanwhile -- the watcher, a CLI
+    sync, an agent calling reindex -- fills some of those in first, and the
+    whole run used to die with "UNIQUE constraint failed on chunks_vec".
+    """
+    store = IndexStore(tmp_path / "index.db")
+    try:
+        if not store.vec_enabled:
+            pytest.skip("sqlite-vec is not available")
+        store.ensure_vec_table(4, "test-embedder")
+        store.insert_embeddings([(1, [0.0, 0.0, 0.0, 1.0], "a.py", "python")])
+
+        store.insert_embeddings([(1, [1.0, 0.0, 0.0, 0.0], "a.py", "python")])
+
+        assert store.get_embedding(1) == [1.0, 0.0, 0.0, 0.0]
+        assert store.conn.execute("SELECT COUNT(*) FROM chunks_vec").fetchone()[0] == 1
+    finally:
+        store.close()

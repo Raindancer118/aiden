@@ -103,12 +103,15 @@ body {
   cursor: pointer;
 }
 
+/* The search field absorbs whatever the rest of the bar does not need, so the
+   header reaches both edges of the window instead of bunching up on the left
+   with dead space on the right. */
 .search {
   position: relative;
   flex: 1 1 auto;
+  min-width: 200px;
   display: flex;
   align-items: center;
-  max-width: 640px;
 }
 
 .search svg {
@@ -799,7 +802,7 @@ pre.code {
   .results { max-height: 34vh; }
   .detail { max-height: 44vh; }
   .topbar { flex-wrap: wrap; }
-  .search { order: 3; flex-basis: 100%; max-width: none; }
+  .search { order: 3; flex-basis: 100%; }  /* its own row once the bar wraps */
 }
 
 @media (prefers-reduced-motion: reduce) {

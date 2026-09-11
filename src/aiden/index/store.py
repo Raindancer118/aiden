@@ -315,12 +315,21 @@ class IndexStore:
         return self.conn.execute("SELECT sid FROM chunks_vec LIMIT 1").fetchone() is not None
 
     def insert_embeddings(self, rows: list[tuple[int, list[float], str, str]]) -> None:
+        """Store vectors for the given symbols, replacing any they already have.
+
+        Replacing rather than inserting is what makes a long embedding run
+        survive company. The set of symbols missing a vector is a snapshot
+        taken before a run that can take minutes; the watcher, a CLI sync or an
+        agent calling reindex can fill some of them in meanwhile, and a plain
+        INSERT then aborts the whole run with "UNIQUE constraint failed on
+        chunks_vec". vec0 tables reject INSERT OR REPLACE, so the delete is
+        issued separately.
+        """
         if not self.vec_enabled or not rows:
             return
-        self.conn.executemany(
-            "INSERT INTO chunks_vec(sid, embedding, path, lang) VALUES(?,?,?,?)",
-            [(sid, _encode_vector(vec), path, lang) for sid, vec, path, lang in rows],
-        )
+        encoded = [(sid, _encode_vector(vec), path, lang) for sid, vec, path, lang in rows]
+        self.conn.executemany("DELETE FROM chunks_vec WHERE sid = ?", [(sid,) for sid, *_ in encoded])
+        self.conn.executemany("INSERT INTO chunks_vec(sid, embedding, path, lang) VALUES(?,?,?,?)", encoded)
 
     def vector_search(self, query_vec: list[float], k: int) -> list[tuple[int, float]]:
         """Return [(symbol_id, distance)] for the k nearest symbols."""
